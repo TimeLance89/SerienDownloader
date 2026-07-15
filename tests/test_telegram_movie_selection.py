@@ -93,6 +93,10 @@ class TelegramMovieSelectionTests(unittest.TestCase):
             patch("server.get_jellyfin_client", return_value=SimpleNamespace(configured=True)),
             patch("server.search_movie_candidates", return_value=[search_result("Dune", "dune")]),
             patch("server._build_telegram_movie_options", return_value=options),
+            patch(
+                "server._filter_existing_telegram_movie_options",
+                return_value=(options, [], ""),
+            ),
             patch("server._publish_telegram_movie_choices") as publish,
             patch("server._run_telegram_movie_request") as run,
         ):
@@ -100,6 +104,88 @@ class TelegramMovieSelectionTests(unittest.TestCase):
 
         publish.assert_called_once_with("123", "Dune", options)
         run.assert_not_called()
+
+    def test_existing_movie_is_not_offered_in_selection(self):
+        existing = option("Titanic", "titanic-1997", "1997")
+        downloadable = option("Titanic II", "titanic-ii", "2010")
+        options = [existing, downloadable]
+        with (
+            patch("server.get_jellyfin_client", return_value=SimpleNamespace(configured=True)),
+            patch(
+                "server.search_movie_candidates",
+                return_value=[search_result("Titanic", "titanic")],
+            ),
+            patch("server._build_telegram_movie_options", return_value=options),
+            patch(
+                "server._filter_existing_telegram_movie_options",
+                return_value=([downloadable], [existing], ""),
+            ),
+            patch("server._publish_telegram_movie_choices") as publish,
+            patch("server._run_telegram_movie_request") as run,
+        ):
+            server._handle_telegram_movie_request("123", "Titanic")
+
+        publish.assert_called_once_with("123", "Titanic", [downloadable])
+        run.assert_not_called()
+        self.assertTrue(any(
+            "nicht zum Download angeboten" in item[1]
+            for item in server._telegram_bot.sent
+        ))
+
+    def test_only_existing_movies_end_without_download(self):
+        existing = option("Titanic", "titanic-1997", "1997")
+        with (
+            patch("server.get_jellyfin_client", return_value=SimpleNamespace(configured=True)),
+            patch(
+                "server.search_movie_candidates",
+                return_value=[search_result("Titanic", "titanic")],
+            ),
+            patch("server._build_telegram_movie_options", return_value=[existing]),
+            patch(
+                "server._filter_existing_telegram_movie_options",
+                return_value=([], [existing], ""),
+            ),
+            patch("server._publish_telegram_movie_choices") as publish,
+            patch("server._run_telegram_movie_request") as run,
+        ):
+            server._handle_telegram_movie_request("123", "Titanic")
+
+        publish.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(any(
+            "„Titanic“ ist bereits vorhanden" in item[1]
+            for item in server._telegram_bot.sent
+        ))
+
+    def test_existing_filter_checks_jellyfin_before_selection(self):
+        existing = option("Titanic", "titanic-1997", "1997")
+        downloadable = option("Titanic II", "titanic-ii", "2010")
+        jf_client = SimpleNamespace(
+            configured=True,
+            match=lambda title, _year, **_kwargs: title == "Titanic",
+        )
+        tmdb_client = SimpleNamespace(movie_summary=lambda _title, _year: None)
+        old_available = server.state.jellyfin_library_available
+        server.state.jellyfin_library_available = True
+        try:
+            with (
+                patch("server.get_jellyfin_client", return_value=jf_client),
+                patch("server.get_tmdb_client", return_value=tmdb_client),
+                patch("server.get_jellyfin_library", return_value=[]) as library,
+                patch("server._existing_valid_movie_path", return_value=None),
+            ):
+                remaining, found_existing, error = (
+                    server._filter_existing_telegram_movie_options(
+                        [existing, downloadable],
+                    )
+                )
+        finally:
+            server.state.jellyfin_library_available = old_available
+
+        self.assertEqual(remaining, [downloadable])
+        self.assertEqual(found_existing, [existing])
+        self.assertEqual(error, "")
+        library.assert_any_call(force=True)
 
     def test_duplicate_sources_are_grouped_but_different_years_remain(self):
         results = [

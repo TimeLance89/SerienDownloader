@@ -110,6 +110,22 @@ class JellyfinClientTests(unittest.TestCase):
 
         self.assertFalse(self.client.match("The Thing", "2011", items=items))
 
+    def test_short_installment_title_matches_long_jellyfin_title(self):
+        items = [{
+            "name": "Breaking Dawn - Bis(s) zum Ende der Nacht - Teil 2",
+            "original_title": "", "sort_name": "", "year": 2012,
+        }]
+
+        self.assertTrue(self.client.match("Breaking Dawn Teil 2", items=items))
+        self.assertFalse(self.client.match("Breaking Dawn Teil 1", items=items))
+
+    def test_base_movie_does_not_match_a_numbered_installment(self):
+        items = [{
+            "name": "Dune: Part Two", "original_title": "", "sort_name": "", "year": 2024,
+        }]
+
+        self.assertFalse(self.client.match("Dune", items=items))
+
     def test_tmdb_movie_id_has_priority_over_localized_title(self):
         items = [{
             "name": "Drachenzähmen leicht gemacht", "original_title": "", "sort_name": "",

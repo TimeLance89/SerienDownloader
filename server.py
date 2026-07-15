@@ -2865,6 +2865,31 @@ def _build_telegram_movie_options(
     return list(grouped.values())
 
 
+def _filter_existing_telegram_movie_options(
+    options: List[dict],
+) -> tuple[Optional[List[dict]], List[dict], str]:
+    """Entfernt vorhandene Filme, bevor Telegram Download-Buttons anzeigt."""
+    jf_items = get_jellyfin_library(force=True)
+    with state.jellyfin_cache_lock:
+        library_available = state.jellyfin_library_available
+    if jf_items is None or not library_available:
+        return None, [], "Jellyfin ist nicht erreichbar"
+
+    downloadable = []
+    existing = []
+    for option in options:
+        movie = option["movie"]
+        result = option["result"]
+        already_available, reason = _content_already_available(movie, result.slug)
+        if already_available:
+            if _is_jellyfin_safety_block(reason):
+                return None, existing, reason
+            existing.append(option)
+        else:
+            downloadable.append(option)
+    return downloadable, existing, ""
+
+
 def _send_telegram_movie_choice_page_locked(token: str, entry: dict) -> bool:
     bot = _telegram_bot
     if bot is None:
@@ -4436,7 +4461,26 @@ def _handle_telegram_movie_request(chat_id: str, query: str):
                 f"❌ „{query}“ wurde gefunden, aber kein funktionierender Hoster ist verfügbar.",
             )
             return
-        if len(options) > 1:
+        requires_selection = len(options) > 1
+        options, existing_options, check_error = _filter_existing_telegram_movie_options(options)
+        if options is None:
+            _telegram_send(
+                chat_id,
+                f"{check_error}. Download wurde zum Duplikatschutz nicht angeboten.",
+            )
+            return
+        if not options:
+            _telegram_send(chat_id, f"✅ „{query}“ ist bereits vorhanden.")
+            return
+        if existing_options:
+            count = len(existing_options)
+            message = (
+                "✅ 1 bereits vorhandener Treffer wird nicht zum Download angeboten."
+                if count == 1
+                else f"✅ {count} bereits vorhandene Treffer werden nicht zum Download angeboten."
+            )
+            _telegram_send(chat_id, message)
+        if requires_selection or len(options) > 1:
             _publish_telegram_movie_choices(chat_id, query, options)
             return
         selected = options[0]
