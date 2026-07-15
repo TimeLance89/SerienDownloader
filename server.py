@@ -2634,6 +2634,20 @@ def _telegram_series_next_markup(token: str, next_index: int) -> dict:
     }]]}
 
 
+def _telegram_movie_choice_markup(token: str, index: int) -> dict:
+    return {"inline_keyboard": [[{
+        "text": "Diesen Film auswählen",
+        "callback_data": f"mr:{token}:{index}",
+    }]]}
+
+
+def _telegram_movie_next_markup(token: str, next_index: int) -> dict:
+    return {"inline_keyboard": [[{
+        "text": "Weitere Treffer anzeigen",
+        "callback_data": f"mrn:{token}:{next_index}",
+    }]]}
+
+
 def _send_telegram_series_choice_page_locked(token: str, entry: dict) -> bool:
     bot = _telegram_bot
     if bot is None:
@@ -2723,6 +2737,7 @@ def _publish_telegram_series_choices_locked(
     now = time.monotonic()
     token = secrets.token_urlsafe(9)
     entry = {
+        "kind": "series",
         "chat_id": chat_id,
         "request": dict(request),
         "candidates": candidates,
@@ -2779,6 +2794,8 @@ def _consume_telegram_series_choice(
             return "expired", None, None
         if entry.get("chat_id") != chat_id:
             return "forbidden", None, None
+        if entry.get("kind", "series") != "series":
+            return "invalid", None, None
         if not entry.get("ready"):
             return "loading", None, None
         candidates = entry.get("candidates") or []
@@ -2799,6 +2816,233 @@ def _prepare_telegram_series_next_page(
             return "expired", None
         if entry.get("chat_id") != chat_id:
             return "forbidden", None
+        if entry.get("kind", "series") != "series":
+            return "invalid", None
+        if not entry.get("ready"):
+            return "loading", None
+        candidates = entry.get("candidates") or []
+        if next_index != entry.get("next_index") or next_index >= len(candidates):
+            return "invalid", None
+        entry["ready"] = False
+        entry["expires_at"] = now + TELEGRAM_SERIES_LOADING_TTL_SECONDS
+        return "ok", entry
+
+
+def _build_telegram_movie_options(
+    query: str, results: List[FilmpalastSearchResult],
+) -> List[dict]:
+    """Lädt Film-Treffer und bündelt identische Titel/Jahre als Fallbacks."""
+    grouped: Dict[tuple, dict] = {}
+    seen_urls: set[str] = set()
+    for candidate in _telegram_best_result(query, results):
+        if not candidate.is_movie:
+            continue
+        try:
+            loaded = load_movie_for_slug(candidate.slug)
+        except Exception as exc:
+            log(f"Telegram-Filmtreffer nicht ladbar ({candidate.slug}): {exc}", "warn")
+            continue
+        if not loaded or not loaded.hosters or loaded.url in seen_urls:
+            continue
+        seen_urls.add(loaded.url)
+        title = strip_source_suffix(loaded.title).strip() or strip_source_suffix(candidate.title).strip()
+        year = str(loaded.year or candidate.year or "")
+        key = (_norm_title(title), year)
+        option = grouped.get(key)
+        if option is None:
+            grouped[key] = {
+                "result": candidate,
+                "movie": loaded,
+                "fallback_movies": [],
+                "title": title,
+                "year": year,
+                "cover_url": loaded.cover_url,
+            }
+        else:
+            option["fallback_movies"].append(loaded)
+            if not option.get("cover_url") and loaded.cover_url:
+                option["cover_url"] = loaded.cover_url
+    return list(grouped.values())
+
+
+def _filter_existing_telegram_movie_options(
+    options: List[dict],
+) -> tuple[Optional[List[dict]], List[dict], str]:
+    """Entfernt vorhandene Filme, bevor Telegram Download-Buttons anzeigt."""
+    jf_items = get_jellyfin_library(force=True)
+    with state.jellyfin_cache_lock:
+        library_available = state.jellyfin_library_available
+    if jf_items is None or not library_available:
+        return None, [], "Jellyfin ist nicht erreichbar"
+
+    downloadable = []
+    existing = []
+    for option in options:
+        movie = option["movie"]
+        result = option["result"]
+        already_available, reason = _content_already_available(movie, result.slug)
+        if already_available:
+            if _is_jellyfin_safety_block(reason):
+                return None, existing, reason
+            existing.append(option)
+        else:
+            downloadable.append(option)
+    return downloadable, existing, ""
+
+
+def _send_telegram_movie_choice_page_locked(token: str, entry: dict) -> bool:
+    bot = _telegram_bot
+    if bot is None:
+        return False
+    chat_id = entry["chat_id"]
+    candidates = entry["candidates"]
+    start = int(entry.get("next_index", 0))
+    end = min(start + TELEGRAM_SERIES_PAGE_SIZE, len(candidates))
+    sent_message_ids = []
+    sent_candidate_count = 0
+
+    for index in range(start, end):
+        with state.telegram_choices_lock:
+            if state.telegram_series_choices.get(token) is not entry:
+                break
+        option = candidates[index]
+        caption = f"{index + 1}. {option['title']}"
+        if option.get("year"):
+            caption += f" ({option['year']})"
+        source_count = 1 + len(option.get("fallback_movies", []))
+        if source_count > 1:
+            caption += f" · {source_count} Quellen"
+        markup = _telegram_movie_choice_markup(token, index)
+        message_id = None
+        cover_url = str(option.get("cover_url") or "")
+        cover_data = _fetch_cover_data(cover_url) if cover_url else None
+        if cover_data:
+            content, content_type = cover_data
+            message_id = bot.send_photo(chat_id, content, caption[:1024], markup, content_type)
+        if message_id is None and cover_url:
+            message_id = bot.send_photo(chat_id, cover_url, caption[:1024], markup)
+        if message_id is None:
+            message_id = bot.send_message(
+                chat_id, f"🖼️ {caption}\n(Cover nicht verfügbar)", markup,
+            )
+        if message_id is not None:
+            sent_message_ids.append(message_id)
+            sent_candidate_count += 1
+
+    with state.telegram_choices_lock:
+        current = state.telegram_series_choices.get(token)
+    if current is not entry:
+        for message_id in sent_message_ids:
+            bot.clear_inline_keyboard(chat_id, message_id)
+        return False
+
+    if sent_candidate_count and end < len(candidates):
+        remaining = len(candidates) - end
+        message_id = bot.send_message(
+            chat_id,
+            f"Noch {remaining} Treffer.",
+            _telegram_movie_next_markup(token, end),
+        )
+        if message_id is not None:
+            sent_message_ids.append(message_id)
+
+    with state.telegram_choices_lock:
+        if state.telegram_series_choices.get(token) is not entry:
+            stale = True
+        else:
+            stale = False
+            entry["message_ids"].extend(sent_message_ids)
+            entry["next_index"] = end if sent_candidate_count else start
+            entry["ready"] = True
+            entry["expires_at"] = time.monotonic() + TELEGRAM_SERIES_CHOICE_TTL_SECONDS
+    if stale:
+        for message_id in sent_message_ids:
+            bot.clear_inline_keyboard(chat_id, message_id)
+        return False
+    return bool(sent_candidate_count)
+
+
+def _publish_telegram_movie_choices(
+    chat_id: str, query: str, options: List[dict],
+) -> None:
+    with state.telegram_choices_publish_lock:
+        if not options or _telegram_bot is None:
+            _telegram_send(chat_id, "❌ Telegram-Auswahl konnte nicht erstellt werden.")
+            return
+        now = time.monotonic()
+        token = secrets.token_urlsafe(9)
+        entry = {
+            "kind": "movie",
+            "chat_id": chat_id,
+            "query": query,
+            "candidates": list(options),
+            "created_at": now,
+            "expires_at": now + TELEGRAM_SERIES_LOADING_TTL_SECONDS,
+            "message_ids": [],
+            "next_index": 0,
+            "ready": False,
+        }
+        old_message_ids = []
+        with state.telegram_choices_lock:
+            _prune_telegram_series_choices_locked(now)
+            for old_token, old_entry in list(state.telegram_series_choices.items()):
+                if old_entry.get("chat_id") == chat_id:
+                    old_message_ids.extend(old_entry.get("message_ids", []))
+                    state.telegram_series_choices.pop(old_token, None)
+            _prune_telegram_series_choices_locked(now, reserve_slot=True)
+            state.telegram_series_choices[token] = entry
+        if old_message_ids:
+            threading.Thread(
+                target=_clear_telegram_choice_keyboards,
+                args=(chat_id, old_message_ids),
+                daemon=True,
+            ).start()
+        _telegram_send(
+            chat_id,
+            f"🔎 {len(options)} Filme gefunden. Bitte den richtigen auswählen:",
+        )
+        if not _send_telegram_movie_choice_page_locked(token, entry):
+            with state.telegram_choices_lock:
+                if state.telegram_series_choices.get(token) is entry:
+                    state.telegram_series_choices.pop(token, None)
+            _telegram_send(chat_id, "❌ Treffer konnten nicht an Telegram gesendet werden.")
+
+
+def _consume_telegram_movie_choice(
+    chat_id: str, token: str, index: int,
+) -> tuple[str, Optional[dict], Optional[dict]]:
+    now = time.monotonic()
+    with state.telegram_choices_lock:
+        _prune_telegram_series_choices_locked(now)
+        entry = state.telegram_series_choices.get(token)
+        if not entry:
+            return "expired", None, None
+        if entry.get("chat_id") != chat_id:
+            return "forbidden", None, None
+        if entry.get("kind") != "movie":
+            return "invalid", None, None
+        if not entry.get("ready"):
+            return "loading", None, None
+        candidates = entry.get("candidates") or []
+        if index < 0 or index >= len(candidates):
+            return "invalid", None, None
+        state.telegram_series_choices.pop(token, None)
+        return "ok", entry, candidates[index]
+
+
+def _prepare_telegram_movie_next_page(
+    chat_id: str, token: str, next_index: int,
+) -> tuple[str, Optional[dict]]:
+    now = time.monotonic()
+    with state.telegram_choices_lock:
+        _prune_telegram_series_choices_locked(now)
+        entry = state.telegram_series_choices.get(token)
+        if not entry:
+            return "expired", None
+        if entry.get("chat_id") != chat_id:
+            return "forbidden", None
+        if entry.get("kind") != "movie":
+            return "invalid", None
         if not entry.get("ready"):
             return "loading", None
         candidates = entry.get("candidates") or []
@@ -3904,7 +4148,7 @@ def _telegram_help_text() -> str:
         "Serientitel ALLES\n"
         "Serientitel Staffel 2\n"
         "Serientitel Staffel 2 EP 5\n"
-        "Mehrere Serientreffer werden mit Cover zur Auswahl angezeigt.\n"
+        "Mehrere Film- und Serientreffer werden mit Cover zur Auswahl angezeigt.\n"
         "/status – laufende Downloads\n"
         "/speicher – freier NAS-Speicher\n"
         "/pfade – Film- und Serienpfad\n"
@@ -4103,6 +4347,153 @@ def _handle_telegram_series_request(chat_id: str, request: dict):
     _run_telegram_series_request(chat_id, request, selected_value)
 
 
+def _run_telegram_movie_request(
+    chat_id: str,
+    query: str,
+    option: dict,
+    wait_for_lock: bool = False,
+):
+    if not state.telegram_request_lock.acquire(blocking=wait_for_lock):
+        _telegram_send(chat_id, "Ein anderer Telegram-Wunsch wird gerade verarbeitet. Versuche es gleich erneut.")
+        return
+    try:
+        jf_client = get_jellyfin_client()
+        if not jf_client.configured:
+            _telegram_send(chat_id, "Jellyfin-URL oder API-Schlüssel fehlt in den Einstellungen.")
+            return
+
+        movie = option["movie"]
+        chosen_result = option["result"]
+        fallback_movies = list(option.get("fallback_movies", []))
+        title = str(option.get("title") or strip_source_suffix(movie.title)).strip()
+        year = str(option.get("year") or movie.year or chosen_result.year or "")
+        _telegram_send(chat_id, f"🔎 Prüfe „{title}“{f' ({year})' if year else ''} …")
+
+        jf_items = get_jellyfin_library(force=True)
+        if jf_items is None or not state.jellyfin_library_available:
+            _telegram_send(chat_id, "Jellyfin ist nicht erreichbar. Download wurde zum Duplikatschutz nicht gestartet.")
+            return
+        tmdb = get_tmdb_client().movie_summary(title, year)
+        if jf_client.match(
+            title, year, items=jf_items, tmdb_id=(tmdb or {}).get("tmdb_id", ""),
+        ):
+            _telegram_send(chat_id, f"✅ „{title}“ ist bereits in Jellyfin vorhanden.")
+            return
+        already_available, reason = _content_already_available(movie, chosen_result.slug)
+        if already_available:
+            _telegram_send(chat_id, f"Download nicht gestartet: „{title}“ ist {reason}.")
+            return
+
+        with state.queue_lifecycle_lock:
+            physically_active = any(
+                chosen_result.slug in _job_queue_slugs(job)
+                for job in state.dl_queue.active_jobs()
+            )
+            with state.queue_claim_lock:
+                with state.download_state_lock:
+                    already_queued = (
+                        chosen_result.slug in state.picked
+                        or chosen_result.slug in state.counted_queue_slugs
+                        or physically_active
+                    )
+                if not already_queued:
+                    state.picked.add(chosen_result.slug)
+        if already_queued:
+            _telegram_send(chat_id, f"„{title}“ ist bereits eingeplant.")
+            return
+
+        state.fp_movies[chosen_result.slug] = movie
+        _persist_queue_state()
+        with state.telegram_jobs_lock:
+            state.telegram_jobs[chosen_result.slug] = {
+                "chat_id": chat_id,
+                "query": query,
+                "title": title,
+                "year": year,
+                "tmdb_id": (tmdb or {}).get("tmdb_id", ""),
+            }
+
+        source_count = 1 + len(fallback_movies)
+        source_note = f" · {source_count} Filmquellen" if source_count > 1 else ""
+        _telegram_send(
+            chat_id,
+            f"⬇️ Gefunden: „{title}“{f' ({year})' if year else ''}{source_note}. Download startet.",
+        )
+        try:
+            accepted = _enqueue_automatic_downloads(
+                [chosen_result.slug],
+                movie_fallbacks={chosen_result.slug: fallback_movies},
+            )
+        except Exception:
+            _telegram_terminal_without_job(
+                chosen_result.slug, False, "Downloadstart fehlgeschlagen", Path(""),
+            )
+            raise
+        if chosen_result.slug not in accepted:
+            _telegram_terminal_without_job(
+                chosen_result.slug, False, "Downloadstart fehlgeschlagen", Path(""),
+            )
+    except Exception as exc:
+        log(f"Telegram-Filmwunsch fehlgeschlagen: {exc}", "warn")
+        _telegram_send(chat_id, f"❌ Filmwunsch fehlgeschlagen: {exc}")
+    finally:
+        state.telegram_request_lock.release()
+
+
+def _handle_telegram_movie_request(chat_id: str, query: str):
+    if not state.telegram_request_lock.acquire(blocking=False):
+        _telegram_send(chat_id, "Ein anderer Telegram-Filmwunsch wird gerade verarbeitet. Versuche es gleich erneut.")
+        return
+    selected = None
+    try:
+        if not get_jellyfin_client().configured:
+            _telegram_send(chat_id, "Jellyfin-URL oder API-Schlüssel fehlt in den Einstellungen.")
+            return
+        _telegram_send(chat_id, f"🔎 Suche Film „{query}“ …")
+        results = search_movie_candidates(query)
+        if not results:
+            _telegram_send(chat_id, f"❌ Kein Film zu „{query}“ gefunden.")
+            return
+        options = _build_telegram_movie_options(query, results)
+        if not options:
+            _telegram_send(
+                chat_id,
+                f"❌ „{query}“ wurde gefunden, aber kein funktionierender Hoster ist verfügbar.",
+            )
+            return
+        requires_selection = len(options) > 1
+        options, existing_options, check_error = _filter_existing_telegram_movie_options(options)
+        if options is None:
+            _telegram_send(
+                chat_id,
+                f"{check_error}. Download wurde zum Duplikatschutz nicht angeboten.",
+            )
+            return
+        if not options:
+            _telegram_send(chat_id, f"✅ „{query}“ ist bereits vorhanden.")
+            return
+        if existing_options:
+            count = len(existing_options)
+            message = (
+                "✅ 1 bereits vorhandener Treffer wird nicht zum Download angeboten."
+                if count == 1
+                else f"✅ {count} bereits vorhandene Treffer werden nicht zum Download angeboten."
+            )
+            _telegram_send(chat_id, message)
+        if requires_selection or len(options) > 1:
+            _publish_telegram_movie_choices(chat_id, query, options)
+            return
+        selected = options[0]
+    except Exception as exc:
+        log(f"Telegram-Filmsuche fehlgeschlagen: {exc}", "warn")
+        _telegram_send(chat_id, f"❌ Filmsuche fehlgeschlagen: {exc}")
+        return
+    finally:
+        state.telegram_request_lock.release()
+
+    _run_telegram_movie_request(chat_id, query, selected)
+
+
 def _clear_telegram_choice_keyboards(chat_id: str, message_ids: List[int]) -> None:
     bot = _telegram_bot
     if bot is None:
@@ -4121,6 +4512,53 @@ def handle_telegram_callback(
     if not allowed_chat or chat_id != allowed_chat:
         bot.answer_callback(callback_query_id, "Nicht erlaubt.")
         log(f"Telegram-Callback von nicht erlaubter Chat-ID {chat_id} verworfen.", "warn")
+        return
+
+    movie_next_match = re.fullmatch(r"mrn:([A-Za-z0-9_-]{8,32}):(\d{1,4})", data or "")
+    if movie_next_match:
+        token, raw_index = movie_next_match.groups()
+        status, entry = _prepare_telegram_movie_next_page(chat_id, token, int(raw_index))
+        if status == "loading":
+            bot.answer_callback(callback_query_id, "Treffer werden noch geladen.")
+            return
+        if status == "forbidden":
+            bot.answer_callback(callback_query_id, "Diese Auswahl gehört zu einem anderen Chat.")
+            return
+        if status != "ok" or entry is None:
+            bot.answer_callback(callback_query_id, "Seite abgelaufen oder bereits geladen.")
+            return
+        bot.answer_callback(callback_query_id, "Weitere Treffer werden geladen.")
+        with state.telegram_choices_publish_lock:
+            if not _send_telegram_movie_choice_page_locked(token, entry):
+                _telegram_send(chat_id, "❌ Weitere Treffer konnten nicht gesendet werden.")
+        return
+
+    movie_match = re.fullmatch(r"mr:([A-Za-z0-9_-]{8,32}):(\d{1,4})", data or "")
+    if movie_match:
+        token, raw_index = movie_match.groups()
+        status, entry, option = _consume_telegram_movie_choice(
+            chat_id, token, int(raw_index),
+        )
+        if status == "loading":
+            bot.answer_callback(callback_query_id, "Treffer werden noch geladen.")
+            return
+        if status == "forbidden":
+            bot.answer_callback(callback_query_id, "Diese Auswahl gehört zu einem anderen Chat.")
+            return
+        if status != "ok" or entry is None or option is None:
+            bot.answer_callback(callback_query_id, "Auswahl abgelaufen oder bereits verwendet.")
+            return
+        title = str(option.get("title") or "Film")
+        bot.answer_callback(callback_query_id, f"Ausgewählt: {title}")
+        threading.Thread(
+            target=_clear_telegram_choice_keyboards,
+            args=(chat_id, list(entry.get("message_ids", []))),
+            daemon=True,
+        ).start()
+        _telegram_send(chat_id, f"✅ Ausgewählt: „{title}“.")
+        _run_telegram_movie_request(
+            chat_id, entry["query"], option, wait_for_lock=True,
+        )
         return
 
     next_match = re.fullmatch(r"srn:([A-Za-z0-9_-]{8,32}):(\d{1,4})", data or "")
@@ -4247,131 +4685,7 @@ def handle_telegram_message(chat_id: str, text: str, sender_name: str = ""):
         _telegram_send(chat_id, "Sende einen Filmtitel oder nutze /status.")
         return
 
-    if not state.telegram_request_lock.acquire(blocking=False):
-        _telegram_send(chat_id, "Ein anderer Telegram-Filmwunsch wird gerade verarbeitet. Versuche es gleich erneut.")
-        return
-    try:
-        jf_client = get_jellyfin_client()
-        if not jf_client.configured:
-            _telegram_send(chat_id, "Jellyfin-URL oder API-Schlüssel fehlt in den Einstellungen.")
-            return
-
-        _telegram_send(chat_id, f"🔎 Prüfe „{query}“ …")
-        jf_items = get_jellyfin_library(force=True)
-        if jf_items is None or not state.jellyfin_library_available:
-            _telegram_send(chat_id, "Jellyfin ist nicht erreichbar. Download wurde zum Duplikatschutz nicht gestartet.")
-            return
-        results = search_movie_candidates(query)
-        if not results:
-            _telegram_send(chat_id, f"❌ Kein Film zu „{query}“ gefunden.")
-            return
-
-        # Nicht nur den ersten Treffer behalten: gleichnamige Treffer anderer
-        # Katalogquellen dienen später als Laufzeit-Fallback, falls sämtliche
-        # Hoster des ersten Treffers beim echten Download scheitern.
-        wanted = _norm_title(query)
-        movie_options: List[tuple] = []
-        seen_movie_urls: set = set()
-        chosen_year = ""
-        for candidate in _telegram_best_result(query, results):
-            if not candidate.is_movie:
-                continue
-            candidate_norm = _norm_title(candidate.title)
-            if wanted and wanted not in candidate_norm:
-                continue
-            loaded = load_movie_for_slug(candidate.slug)
-            if not loaded or not loaded.hosters:
-                continue
-            loaded_norm = _norm_title(loaded.title)
-            if wanted and wanted not in loaded_norm:
-                continue
-            loaded_year = str(loaded.year or candidate.year or "")
-            if chosen_year and loaded_year and loaded_year != chosen_year:
-                continue
-            if loaded.url in seen_movie_urls:
-                continue
-            if not movie_options:
-                chosen_year = loaded_year
-            seen_movie_urls.add(loaded.url)
-            movie_options.append((candidate, loaded))
-            if len(movie_options) >= 8:
-                break
-
-        if not movie_options:
-            _telegram_send(chat_id, f"❌ „{query}“ wurde gefunden, aber kein funktionierender Hoster ist verfügbar.")
-            return
-
-        chosen_result, movie = movie_options[0]
-        fallback_movies = [loaded for _candidate, loaded in movie_options[1:]]
-
-        title = strip_source_suffix(movie.title)
-        tmdb = get_tmdb_client().movie_summary(title, movie.year)
-        if jf_client.match(
-            title, movie.year, items=jf_items, tmdb_id=(tmdb or {}).get("tmdb_id", ""),
-        ):
-            _telegram_send(chat_id, f"✅ „{title}“ ist bereits in Jellyfin vorhanden.")
-            return
-        already_available, reason = _content_already_available(movie, chosen_result.slug)
-        if already_available:
-            _telegram_send(
-                chat_id,
-                f"Download nicht gestartet: „{title}“ ist {reason}.",
-            )
-            return
-
-        with state.queue_lifecycle_lock:
-            physically_active = any(
-                chosen_result.slug in _job_queue_slugs(job)
-                for job in state.dl_queue.active_jobs()
-            )
-            with state.queue_claim_lock:
-                with state.download_state_lock:
-                    already_queued = (
-                        chosen_result.slug in state.picked
-                        or chosen_result.slug in state.counted_queue_slugs
-                        or physically_active
-                    )
-                if not already_queued:
-                    state.picked.add(chosen_result.slug)
-        if already_queued:
-            _telegram_send(chat_id, f"„{title}“ ist bereits eingeplant.")
-            return
-
-        state.fp_movies[chosen_result.slug] = movie
-        _persist_queue_state()
-        with state.telegram_jobs_lock:
-            state.telegram_jobs[chosen_result.slug] = {
-                "chat_id": chat_id,
-                "query": query,
-                "title": title,
-                "year": movie.year or chosen_result.year,
-                "tmdb_id": (tmdb or {}).get("tmdb_id", ""),
-            }
-
-        source_note = f" · {len(movie_options)} Filmquellen" if len(movie_options) > 1 else ""
-        _telegram_send(
-            chat_id,
-            f"⬇️ Gefunden: „{title}“{f' ({movie.year})' if movie.year else ''}{source_note}. Download startet.",
-        )
-        try:
-            accepted = _enqueue_automatic_downloads(
-                [chosen_result.slug],
-                movie_fallbacks={chosen_result.slug: fallback_movies},
-            )
-        except Exception:
-            _telegram_terminal_without_job(
-                chosen_result.slug, False, "Downloadstart fehlgeschlagen", Path(""),
-            )
-            raise
-        if chosen_result.slug not in accepted:
-            _telegram_terminal_without_job(
-                chosen_result.slug, False, "Downloadstart fehlgeschlagen", Path(""),
-            )
-    except Exception as exc:
-        log(f"Telegram-Filmwunsch fehlgeschlagen: {exc}", "warn")
-        _telegram_send(chat_id, f"❌ Filmwunsch fehlgeschlagen: {exc}")
-    finally:
-        state.telegram_request_lock.release()
+    _handle_telegram_movie_request(chat_id, query)
 
 
 # ---------------------------------------------------------------------------

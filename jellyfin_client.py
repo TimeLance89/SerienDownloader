@@ -25,6 +25,44 @@ def _normalize(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", ascii_title.casefold())
 
 
+_PART_MARKERS = {"teil", "part", "chapter", "kapitel", "volume", "vol"}
+_PART_NUMBERS = {
+    "one": "1", "eins": "1", "i": "1",
+    "two": "2", "zwei": "2", "ii": "2",
+    "three": "3", "drei": "3", "iii": "3",
+    "four": "4", "vier": "4", "iv": "4",
+    "five": "5", "funf": "5", "v": "5",
+}
+
+
+def _title_tokens(title: str) -> List[str]:
+    ascii_title = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode("ascii")
+    return re.findall(r"[a-z0-9]+", ascii_title.casefold())
+
+
+def _installment_parts(title: str) -> tuple[Optional[str], set[str]]:
+    tokens = _title_tokens(title)
+    for index, token in enumerate(tokens[:-1]):
+        if token not in _PART_MARKERS:
+            continue
+        number = _PART_NUMBERS.get(tokens[index + 1], tokens[index + 1])
+        base = set(tokens[:index] + tokens[index + 2:])
+        return number, base
+    return None, set(tokens)
+
+
+def _same_installment_title(wanted: str, candidate: str) -> bool:
+    """Erkennt verkürzte Untertitel nur bei identischer Teilnummer."""
+    wanted_part, wanted_base = _installment_parts(wanted)
+    candidate_part, candidate_base = _installment_parts(candidate)
+    return bool(
+        wanted_part
+        and wanted_part == candidate_part
+        and len(wanted_base) >= 2
+        and wanted_base <= candidate_base
+    )
+
+
 class JellyfinClient:
     def __init__(self, base_url: str = "", api_key: str = "", timeout: float = 5.0):
         self.base_url = (base_url or "").rstrip("/")
@@ -113,7 +151,10 @@ class JellyfinClient:
         title_matches = []
         for it in candidates:
             aliases = (it.get("name"), it.get("original_title"), it.get("sort_name"))
-            if norm_title in {_normalize(alias) for alias in aliases if alias}:
+            if any(
+                norm_title == _normalize(alias) or _same_installment_title(title, alias)
+                for alias in aliases if alias
+            ):
                 title_matches.append(it)
         if not title_matches:
             return False
