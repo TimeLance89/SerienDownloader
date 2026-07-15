@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 _config_lock = threading.RLock()
 
 APP_NAME = "FilmeDownloader"
+MOVIE_PROVIDER_DEFAULTS = ("filmpalast", "moflix", "einschalten", "kinox")
+SERIES_PROVIDER_DEFAULTS = ("serienstream", "filmpalast", "moflix")
 
 
 def _config_dir() -> Path:
@@ -153,6 +155,44 @@ def load_series_path() -> str:
 
 def save_series_path(series_path: str) -> bool:
     return _update_all({"series_path": series_path})
+
+
+def normalize_provider_order(value, supported) -> List[str]:
+    """Behält nur bekannte Anbieter, entfernt Duplikate und ergänzt fehlende."""
+    if isinstance(value, str):
+        requested = value.split(",")
+    else:
+        requested = value or []
+    allowed = tuple(str(provider).strip().casefold() for provider in supported)
+    normalized: List[str] = []
+    for provider in requested:
+        key = str(provider).strip().casefold()
+        if key in allowed and key not in normalized:
+            normalized.append(key)
+    normalized.extend(provider for provider in allowed if provider not in normalized)
+    return normalized
+
+
+def load_provider_priorities() -> dict:
+    """Lädt die Reihenfolge, in der Katalogquellen gesucht und versucht werden."""
+    values = _read_all()
+    return {
+        "movies": normalize_provider_order(
+            values.get("movie_provider_priority", ""), MOVIE_PROVIDER_DEFAULTS,
+        ),
+        "series": normalize_provider_order(
+            values.get("series_provider_priority", ""), SERIES_PROVIDER_DEFAULTS,
+        ),
+    }
+
+
+def save_provider_priorities(movies, series) -> bool:
+    movie_order = normalize_provider_order(movies, MOVIE_PROVIDER_DEFAULTS)
+    series_order = normalize_provider_order(series, SERIES_PROVIDER_DEFAULTS)
+    return _update_all({
+        "movie_provider_priority": ",".join(movie_order),
+        "series_provider_priority": ",".join(series_order),
+    })
 
 
 def load_jellyfin() -> dict:

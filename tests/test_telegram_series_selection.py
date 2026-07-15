@@ -92,7 +92,7 @@ class TelegramSeriesSelectionTests(unittest.TestCase):
 
         with (
             patch("server.get_jellyfin_client", return_value=SimpleNamespace(configured=True)),
-            patch("server._sto_search_series", return_value=matches),
+            patch("server.search_series_candidates", return_value=matches),
             patch("server._publish_telegram_series_choices") as publish,
             patch("server._run_telegram_series_request") as run,
         ):
@@ -107,7 +107,7 @@ class TelegramSeriesSelectionTests(unittest.TestCase):
 
         with (
             patch("server.get_jellyfin_client", return_value=SimpleNamespace(configured=True)),
-            patch("server._sto_search_series", return_value=[match]),
+            patch("server.search_series_candidates", return_value=[match]),
             patch("server._run_telegram_series_request") as run,
         ):
             server._handle_telegram_series_request("123", request)

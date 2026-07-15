@@ -35,6 +35,7 @@ RUN python -c "import nodriver_patch; nodriver_patch.ensure_cdp_utf8()" || true
 #  - HOST/PORT:         im Netzwerk erreichbar machen (0.0.0.0).
 #  - OPEN_BROWSER=0:    im Container KEINEN Browser öffnen.
 #  - CHROME_PATH:       Explizites Chromium-Binary für den VOE-Browser-Pool.
+ARG APP_COMMIT_SHA=""
 ENV SERIENDL_DATA_DIR=/app/data \
     DOWNLOAD_DIR=/movies \
     SERIES_DIR=/serien \
@@ -42,6 +43,7 @@ ENV SERIENDL_DATA_DIR=/app/data \
     PORT=8765 \
     OPEN_BROWSER=0 \
     CHROME_PATH=/usr/bin/chromium \
+    APP_COMMIT_SHA=${APP_COMMIT_SHA} \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8765

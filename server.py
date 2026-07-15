@@ -67,6 +67,7 @@ from jellyfin_recommender import (
 from tmdb_client import SERIES_CACHE_TTL, TMDBClient
 from telegram_bot import TelegramBot
 from seerr_client import SeerrClient, SeerrRequest
+from update_checker import UpdateChecker
 from watchlist_policy import (
     WATCH_MODE_DEFAULT,
     WATCH_MODE_LABELS,
@@ -92,6 +93,18 @@ WEB_DIR = Path(__file__).parent / "web"
 APP_USERNAME = os.environ.get("APP_USERNAME", "").strip()
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 AUTH_ENABLED = bool(APP_USERNAME and APP_PASSWORD)
+UPDATE_CHECKER = UpdateChecker(
+    repository=os.environ.get("UPDATE_GITHUB_REPOSITORY", "TimeLance89/SerienDownloader"),
+    branch=os.environ.get("UPDATE_GITHUB_BRANCH", "main"),
+    app_dir=Path(__file__).parent,
+)
+PROVIDER_LABELS = {
+    "filmpalast": "Filmpalast",
+    "moflix": "Moflix",
+    "einschalten": "Einschalten",
+    "kinox": "Kinox",
+    "serienstream": "Serienstream",
+}
 
 
 def _authorized_header(value: str) -> bool:
@@ -139,6 +152,8 @@ class AppState:
         self.seerr_moonfin_error: str = ""
         # Automatik (24/7): Auto-Download abonnierter Serien + Zeitsteuerung.
         self.automation: dict = appconfig.load_automation()
+        self.provider_priorities: dict = appconfig.load_provider_priorities()
+        self.provider_priority_lock = threading.RLock()
         self.jellyfin_library: Optional[List[dict]] = None
         self.jellyfin_library_time: float = 0.0
         self.jellyfin_library_available: bool = False
@@ -563,6 +578,39 @@ def strip_source_suffix(title: str) -> str:
     return re.sub(r"\s*\[[^\]]+\]\s*$", "", title or "")
 
 
+def provider_priority(media_type: str) -> List[str]:
+    defaults = (
+        appconfig.MOVIE_PROVIDER_DEFAULTS
+        if media_type == "movies"
+        else appconfig.SERIES_PROVIDER_DEFAULTS
+    )
+    with state.provider_priority_lock:
+        configured = state.provider_priorities.get(media_type, defaults)
+        return appconfig.normalize_provider_order(configured, defaults)
+
+
+def provider_for_value(value: str) -> str:
+    """Erkennt die Katalogquelle an Prefix oder URL; alte Slugs sind Filmpalast."""
+    source = str(value or "").strip().casefold()
+    if source.startswith(SERIENSTREAM_PREFIX) or "serienstream.to" in source:
+        return "serienstream"
+    if source.startswith(MOFLIX_PREFIX) or "moflix-stream.xyz" in source:
+        return "moflix"
+    if source.startswith(EINSCHALTEN_PREFIX) or "einschalten.in" in source:
+        return "einschalten"
+    if source.startswith(KINOX_PREFIX) or "kinox.camp" in source:
+        return "kinox"
+    return "filmpalast"
+
+
+def _ordered_episode_sources(movies: List[FilmpalastMovie]) -> List[FilmpalastMovie]:
+    positions = {provider: index for index, provider in enumerate(provider_priority("series"))}
+    return sorted(
+        movies,
+        key=lambda movie: positions.get(provider_for_value(movie.url), len(positions)),
+    )
+
+
 def clean_genre(value: str) -> str:
     return " ".join(str(value or "").split())
 
@@ -599,12 +647,13 @@ def search_movie_candidates(query: str) -> List[FilmpalastSearchResult]:
         with state.fp_lock:
             return list(get_fp_scraper().search(q))
 
-    tasks = [
-        ("Filmpalast", _fp),
-        ("Moflix", lambda: MoflixScraper(progress_cb=log).search(q)),
-        ("Einschalten", lambda: EinschaltenScraper(progress_cb=log).search(q)),
-        ("Kinox", lambda: KinoxScraper(progress_cb=log).search(q)),
-    ]
+    searches = {
+        "filmpalast": _fp,
+        "moflix": lambda: MoflixScraper(progress_cb=log).search(q),
+        "einschalten": lambda: EinschaltenScraper(progress_cb=log).search(q),
+        "kinox": lambda: KinoxScraper(progress_cb=log).search(q),
+    }
+    tasks = [(PROVIDER_LABELS[key], searches[key]) for key in provider_priority("movies")]
     results: List[FilmpalastSearchResult] = []
     with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
         futures = [(name, pool.submit(fn)) for name, fn in tasks]
@@ -618,7 +667,8 @@ def search_movie_candidates(query: str) -> List[FilmpalastSearchResult]:
 
 def list_movie_candidates(mode: str, page: int = 1) -> List[FilmpalastSearchResult]:
     """Neu/Top parallel laden und kurz cachen – beschleunigt den App-Start."""
-    cache_key = (mode, int(page))
+    priority = provider_priority("movies")
+    cache_key = (mode, int(page), tuple(priority))
     with state.movie_list_cache_lock:
         cached = state.movie_list_cache.get(cache_key)
         if cached and time.time() - cached[0] < 300:
@@ -628,13 +678,14 @@ def list_movie_candidates(mode: str, page: int = 1) -> List[FilmpalastSearchResu
         with state.fp_lock:
             return list(get_fp_scraper().list_movies(mode, page))
 
-    tasks = [("Filmpalast", _fp)]
-    if page == 1:
-        tasks.extend([
-            ("Moflix", lambda: MoflixScraper(progress_cb=log).list_movies(mode, page)),
-            ("Einschalten", lambda: EinschaltenScraper(progress_cb=log).list_movies(mode, page)),
-            ("Kinox", lambda: KinoxScraper(progress_cb=log).list_movies(mode, page)),
-        ])
+    listings = {
+        "filmpalast": _fp,
+        "moflix": lambda: MoflixScraper(progress_cb=log).list_movies(mode, page),
+        "einschalten": lambda: EinschaltenScraper(progress_cb=log).list_movies(mode, page),
+        "kinox": lambda: KinoxScraper(progress_cb=log).list_movies(mode, page),
+    }
+    included = priority if page == 1 else ["filmpalast"]
+    tasks = [(PROVIDER_LABELS[key], listings[key]) for key in included]
     results: List[FilmpalastSearchResult] = []
     with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
         futures = [(name, pool.submit(fn)) for name, fn in tasks]
@@ -678,7 +729,7 @@ def warm_home_movie_cache():
         log(f"Startansicht konnte nicht vorab geladen werden: {exc}", "warn")
 
 
-# --- Serien: ausschließlich serienstream.to ---------------------------------
+# --- Serienanbieter ----------------------------------------------------------
 def _sto_get_series(value: str) -> Optional[FilmpalastSeries]:
     with state.sto_lock:
         return get_sto_scraper().get_series(value)
@@ -687,6 +738,49 @@ def _sto_get_series(value: str) -> Optional[FilmpalastSeries]:
 def _sto_search_series(query: str) -> List[FilmpalastSeriesResult]:
     with state.sto_lock:
         return get_sto_scraper().search_series(query)
+
+
+def _search_series_for_provider(provider: str, query: str) -> List[FilmpalastSeriesResult]:
+    if provider == "serienstream":
+        return _sto_search_series(query)
+    if provider == "filmpalast":
+        with state.fp_lock:
+            return get_fp_scraper().search_series(query)
+    if provider == "moflix":
+        return MoflixScraper(progress_cb=log).search_series(query)
+    return []
+
+
+def _load_series_for_provider(provider: str, value: str) -> Optional[FilmpalastSeries]:
+    if provider == "serienstream":
+        return _sto_get_series(value)
+    if provider == "filmpalast":
+        with state.fp_lock:
+            return get_fp_scraper().get_series(value)
+    if provider == "moflix":
+        return MoflixScraper(progress_cb=log).get_series(value)
+    return None
+
+
+def search_series_candidates(query: str) -> List[FilmpalastSeriesResult]:
+    """Durchsucht alle Serienkataloge und behält die konfigurierte Reihenfolge."""
+    q = query.strip()
+    if not q:
+        return []
+    priority = provider_priority("series")
+    tasks = [
+        (provider, lambda key=provider: _search_series_for_provider(key, q))
+        for provider in priority
+    ]
+    results: List[FilmpalastSeriesResult] = []
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = [(provider, pool.submit(fn)) for provider, fn in tasks]
+        for provider, future in futures:
+            try:
+                results.extend(future.result())
+            except Exception as exc:
+                log(f"{PROVIDER_LABELS[provider]} Seriensuche übersprungen: {exc}", "warn")
+    return results
 
 
 def _norm_title(title: str) -> str:
@@ -750,47 +844,48 @@ def _best_title_match(title: str, results: List[FilmpalastSeriesResult]) -> Opti
     return partial[0] if partial else None
 
 
-def _sto_find_by_title(value: str) -> Optional[FilmpalastSeries]:
-    """Findet dieselbe Serie auf serienstream.to per Titel-Match. Fallback, wenn
-    ein Direktwert nicht lädt oder ein Alt-/Fremdwert (Moflix/Filmpalast aus alter
-    Watchlist) übergeben wird."""
+def _find_series_by_title(
+    value: str, providers: Optional[List[str]] = None,
+) -> Optional[FilmpalastSeries]:
+    """Sucht und lädt dieselbe Serie nach konfigurierter Anbieterpriorität."""
     title = _series_search_title(value)
     if not title:
         return None
-    log(f"Serie nicht direkt ladbar – suche «{title}» auf serienstream.to …")
-    try:
-        results = _sto_search_series(title)
-    except Exception as exc:
-        log(f"  serienstream Suche fehlgeschlagen: {exc}", "warn")
-        return None
-    best = _best_title_match(title, results)
-    if not best:
-        log("  Keine passende Serie auf serienstream.to gefunden.", "warn")
-        return None
-    try:
-        series = _sto_get_series(best.sample_slug)
-    except Exception as exc:
-        log(f"  serienstream Laden fehlgeschlagen: {exc}", "warn")
-        series = None
-    if series and series.seasons:
-        log(f"  Gefunden auf serienstream.to ({len(series.all_episodes)} Episoden).")
-        return series
+    for provider in providers or provider_priority("series"):
+        label = PROVIDER_LABELS[provider]
+        log(f"Serie nicht direkt ladbar – suche «{title}» bei {label} …")
+        try:
+            results = _search_series_for_provider(provider, title)
+            best = _best_title_match(title, results)
+            series = _load_series_for_provider(provider, best.sample_slug) if best else None
+        except Exception as exc:
+            log(f"  {label}-Suche/Laden fehlgeschlagen: {exc}", "warn")
+            continue
+        if series and series.seasons:
+            log(f"  Gefunden bei {label} ({len(series.all_episodes)} Episoden).")
+            return series
     return None
 
 
+def _sto_find_by_title(value: str) -> Optional[FilmpalastSeries]:
+    """Kompatibilitätshelfer für gezielte Serienstream-Suche."""
+    return _find_series_by_title(value, ["serienstream"])
+
+
 def get_series_for_value(value: str) -> Optional[FilmpalastSeries]:
-    """Serien kommen ausschließlich von serienstream.to. Ist der Wert bereits ein
-    s.to-Wert, wird direkt geladen; schlägt das fehl oder ist es ein Alt-/Fremd-
-    wert, wird dieselbe Serie per Titel-Match auf s.to gesucht."""
-    if value.startswith(SERIENSTREAM_PREFIX) or "serienstream.to" in value:
-        try:
-            series = _sto_get_series(value)
-        except Exception as exc:
-            log(f"serienstream Serien-Laden fehlgeschlagen: {exc}", "warn")
-            series = None
-        if series and series.seasons:
-            return series
-    return _sto_find_by_title(value)
+    """Lädt eine explizite Quelle direkt, danach greifen die Prioritäts-Fallbacks."""
+    provider = provider_for_value(value)
+    try:
+        series = _load_series_for_provider(provider, value)
+    except Exception as exc:
+        log(f"{PROVIDER_LABELS[provider]} Serien-Laden fehlgeschlagen: {exc}", "warn")
+        series = None
+    if series and series.seasons:
+        return series
+    fallbacks = [key for key in provider_priority("series") if key != provider]
+    if provider in appconfig.SERIES_PROVIDER_DEFAULTS:
+        fallbacks.append(provider)
+    return _find_series_by_title(value, fallbacks)
 
 
 def movie_to_dict(movie: FilmpalastMovie) -> dict:
@@ -1498,12 +1593,6 @@ SERIES_MAX_WAVES = 8            # max. Anzahl Wellen (Sicherheitskappe)
 SERIES_WAVE_COOLDOWN = 90      # zusätzl. Pause (s) nach Leeren der Queue, bevor
                                # die nächste Welle das Rate-Fenster erneut testet
 
-# Fallback-Anbieter für Serien-Episoden: kann serienstream.to eine Episode wegen
-# des Cloudflare-/Captcha-Gates nicht liefern, wird dieselbe Episode (per Titel-
-# Match + Staffel/Episode) bei diesen Anbietern geholt. Reihenfolge = Priorität.
-SERIES_FALLBACK_PROVIDERS = ("filmpalast", "moflix")
-
-
 def _gated_retry_worker() -> None:
     """Fuehrt alle Gate-Retries seriell nach echter Queue-Ruhe aus."""
     try:
@@ -1673,21 +1762,10 @@ def _fallback_get_series(provider: str, title: str) -> Optional[FilmpalastSeries
     series: Optional[FilmpalastSeries] = None
     matched = False
     try:
-        if provider == "filmpalast":
-            scraper = get_fp_scraper()
-            # search_series + get_series unter EINEM Lock; load_movie_for_slug
-            # (das erneut fp_lock nimmt) wird erst NACH Freigabe aufgerufen.
-            with state.fp_lock:
-                results = scraper.search_series(title)
-                best = _best_title_match(title, results)
-                matched = best is not None
-                series = scraper.get_series(best.sample_slug) if best else None
-        elif provider == "moflix":
-            scraper = MoflixScraper(progress_cb=log)
-            results = scraper.search_series(title)
-            best = _best_title_match(title, results)
-            matched = best is not None
-            series = scraper.get_series(best.sample_slug) if best else None
+        results = _search_series_for_provider(provider, title)
+        best = _best_title_match(title, results)
+        matched = best is not None
+        series = _load_series_for_provider(provider, best.sample_slug) if best else None
     except Exception as exc:
         log(f"  {provider}-Fallback-Suche fehlgeschlagen: {exc}", "warn")
         # Netzwerk-/Cloudflare-Fehler sind kein bestaetigtes "nicht vorhanden".
@@ -1702,11 +1780,17 @@ def _fallback_get_series(provider: str, title: str) -> Optional[FilmpalastSeries
     return series
 
 
+# Nur als überschreibbarer Kompatibilitätspunkt für bestehende Integrationen;
+# None bedeutet: immer die live konfigurierte Reihenfolge verwenden.
+SERIES_FALLBACK_PROVIDERS: Optional[tuple[str, ...]] = None
+
+
 def find_episode_fallbacks(
     title: str,
     season: int,
     episode: int,
     aliases: tuple[str, ...] = (),
+    source_slug: str = "",
 ) -> List[FilmpalastMovie]:
     """Lädt dieselbe Episode bei allen passenden Fallback-Katalogen.
 
@@ -1725,7 +1809,11 @@ def find_episode_fallbacks(
         seen_titles.add(key)
         search_titles.append(candidate)
 
-    for provider in SERIES_FALLBACK_PROVIDERS:
+    source_provider = provider_for_value(source_slug) if source_slug else ""
+    fallback_providers = SERIES_FALLBACK_PROVIDERS or tuple(provider_priority("series"))
+    for provider in fallback_providers:
+        if provider == source_provider:
+            continue
         series = None
         for search_title in search_titles:
             series = _fallback_get_series(provider, search_title)
@@ -1775,8 +1863,8 @@ def _extract_from_movie(
 ) -> _HosterResult:
     """Probiert der Reihe nach die Hoster eines Movies (nach hoster_intel-Ranking)
     durch, löst serienstream-Redirects lazy auf und liefert den ersten nutzbaren
-    Stream. Funktioniert für serienstream- UND Fallback-Movies (Filmpalast/Moflix),
-    da Nicht-s.to-Hoster einfach ihre direkte URL verwenden."""
+    Stream. Funktioniert für alle konfigurierten Katalogquellen, da Nicht-s.to-
+    Hoster einfach ihre direkte URL verwenden."""
     res = _HosterResult()
     session = state.fp_scraper.session._curl if state.fp_scraper else None
     excluded_hoster_urls = excluded_hoster_urls or set()
@@ -2116,6 +2204,7 @@ def _enqueue_hoster_attempt(
                     ep_info[1],
                     ep_info[2],
                     aliases=_episode_fallback_aliases(movie_slug, series_title),
+                    source_slug=movie_slug,
                 )
                 seen = {m.url for m in source_movies}
                 source_movies.extend(m for m in alternatives if m.url not in seen)
@@ -2394,12 +2483,12 @@ def run_download_queue(
                     on_job_done(True, "bereits vorhanden", movie.title, existing_file, slug=movie_slug)
                 continue
 
-            # Konnte bereits die Episodenseite waehrend der Vorbereitung nicht
+            # Konnte bereits die Episodenseite während der Vorbereitung nicht
             # geladen werden, bleibt der logische Job trotzdem erhalten. Vor
-            # jedem Versuch die s.to-Quelle erneut laden; danach folgen die
-            # Katalog-Fallbacks und gegebenenfalls die Cooldown-Wellen.
+            # jedem Versuch die gewählte Quelle erneut laden; danach folgen die
+            # Katalog-Fallbacks und bei Serienstream gegebenenfalls Cooldowns.
             primary_unavailable = False
-            if not movie.hosters and movie_slug.startswith(SERIENSTREAM_PREFIX):
+            if not movie.hosters:
                 try:
                     refreshed_movie = load_movie_for_slug(movie_slug)
                 except Exception as exc:
@@ -2408,7 +2497,7 @@ def run_download_queue(
                 if refreshed_movie and refreshed_movie.hosters:
                     movie = refreshed_movie
                     state.fp_movies[movie_slug] = refreshed_movie
-                else:
+                elif movie_slug.startswith(SERIENSTREAM_PREFIX):
                     primary_unavailable = True
         else:
             primary_unavailable = False
@@ -2432,6 +2521,29 @@ def run_download_queue(
             source_movies.append(fallback_movie)
             seen_source_urls.add(fallback_movie.url)
         source_fallbacks_loaded = [movie_fallbacks is not None and movie_slug in movie_fallbacks]
+        # Watchlist-Einträge behalten ihren ursprünglichen Katalog-Slug. Wurde
+        # später eine andere Primärquelle konfiguriert, laden wir deren Treffer
+        # vorab und sortieren die tatsächlich nutzbaren Quellen neu.
+        if (
+            ep_info
+            and provider_for_value(movie_slug) != provider_priority("series")[0]
+            and not source_fallbacks_loaded[0]
+        ):
+            source_fallbacks_loaded[0] = True
+            alternatives = find_episode_fallbacks(
+                orig_series_title,
+                ep_info[1],
+                ep_info[2],
+                aliases=_episode_fallback_aliases(movie_slug, orig_series_title),
+                source_slug=movie_slug,
+            )
+            for candidate in alternatives:
+                if candidate.url not in seen_source_urls:
+                    source_movies.append(candidate)
+                    seen_source_urls.add(candidate.url)
+        if ep_info:
+            source_movies = _ordered_episode_sources(source_movies)
+            movie = source_movies[0]
         source_index = 0
 
         with state.hoster_extract_lock:
@@ -2453,6 +2565,7 @@ def run_download_queue(
                         ep_info[1],
                         ep_info[2],
                         aliases=_episode_fallback_aliases(movie_slug, orig_series_title),
+                        source_slug=movie_slug,
                     )
                     source_movies.extend(
                         candidate for candidate in alternatives
@@ -2587,7 +2700,7 @@ def _rank_telegram_series_results(
         key = result.base_slug or result.sample_slug
         if key and key not in unique:
             unique[key] = result
-    return sorted(
+    ranked = sorted(
         unique.values(),
         key=lambda result: (
             _norm_title(result.title) != wanted,
@@ -2595,9 +2708,19 @@ def _rank_telegram_series_results(
             abs(len(_norm_title(result.title)) - len(wanted)),
             not _norm_title(result.title).startswith(wanted),
             strip_source_suffix(result.title).casefold(),
-            result.base_slug,
         ),
     )
+    # Identische Titel verschiedener Anbieter sind keine Auswahlvarianten. Der
+    # erste Treffer folgt der Nutzerpriorität; weitere Quellen bleiben Fallbacks.
+    deduped: List[FilmpalastSeriesResult] = []
+    seen_titles: set[str] = set()
+    for result in ranked:
+        title_key = _norm_title(result.title)
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        deduped.append(result)
+    return deduped
 
 
 def _prune_telegram_series_choices_locked(
@@ -3660,7 +3783,7 @@ def _seerr_find_series(metadata: dict) -> Optional[FilmpalastSeries]:
     wanted = {_norm_title(value) for value in titles if _norm_title(value)}
     matches: Dict[str, FilmpalastSeriesResult] = {}
     for query in titles:
-        for candidate in _sto_search_series(query):
+        for candidate in search_series_candidates(query):
             if _norm_title(candidate.title) in wanted:
                 matches.setdefault(candidate.sample_slug, candidate)
     if not matches:
@@ -3691,10 +3814,9 @@ def _seerr_find_series(metadata: dict) -> Optional[FilmpalastSeries]:
         raise RuntimeError(
             "Serientreffer ist ohne bestätigte TMDB-ID mehrdeutig und muss geprüft werden"
         )
-    candidates = verified
-    if len(candidates) != 1:
-        raise RuntimeError("Serientreffer ist mehrdeutig und muss geprüft werden")
-    return get_series_for_value(candidates[0].sample_slug)
+    # Mehrere bestätigte Treffer derselben TMDB-Serie sind Anbieter-Fallbacks;
+    # search_series_candidates liefert sie bereits in Nutzerpriorität.
+    return get_series_for_value(verified[0].sample_slug)
 
 
 def _seerr_process_series(request: SeerrRequest, metadata: dict) -> None:
@@ -4082,7 +4204,7 @@ def _telegram_best_result(query: str, results: List[FilmpalastSearchResult]) -> 
         key=lambda result: (
             _norm_title(result.title) != wanted,
             wanted not in _norm_title(result.title),
-            result.title.casefold(),
+            strip_source_suffix(result.title).casefold(),
         ),
     )
 
@@ -4312,8 +4434,7 @@ def _run_telegram_series_request(
 def _handle_telegram_series_request(chat_id: str, request: dict):
     title = str(request.get("title") or "").strip()
     if (
-        title.startswith(SERIENSTREAM_PREFIX)
-        or "serienstream.to" in title
+        title.startswith((SERIENSTREAM_PREFIX, MOFLIX_PREFIX, EINSCHALTEN_PREFIX, KINOX_PREFIX))
         or title.startswith("http://")
         or title.startswith("https://")
     ):
@@ -4329,7 +4450,7 @@ def _handle_telegram_series_request(chat_id: str, request: dict):
             return
         scope_label = _telegram_series_scope_label(request)
         _telegram_send(chat_id, f"🔎 Suche Serie „{title}“ · {scope_label} …")
-        results = _rank_telegram_series_results(title, _sto_search_series(title))
+        results = _rank_telegram_series_results(title, search_series_candidates(title))
         if not results:
             _telegram_send(chat_id, f"❌ Serie „{title}“ nicht gefunden.")
             return
@@ -4710,7 +4831,7 @@ def is_within_download_window() -> bool:
 def _auto_download_new_episodes():
     """Lädt alle als neu erkannten Episoden abonnierter Serien automatisch
     herunter (nutzt dieselbe Pipeline wie der manuelle Download inkl.
-    serienstream-Gate-Fallback auf Filmpalast/Moflix). Neue Jobs werden auch
+    konfigurierter Anbieter-Fallbacks). Neue Jobs werden auch
     während eines laufenden Downloads an dieselbe 2-Slot-Queue angehängt."""
     # Trigger nicht verwerfen: Ein direkt danach abgeschlossener Abo-/JF-Check
     # kann zusätzliche Slugs geliefert haben, die der erste Snapshot nicht sah.
@@ -5033,29 +5154,35 @@ async def api_movies(mode: str = "search", query: str = "", genre: str = "", pag
             return {"results": results, "category": None, "page": 1, "last_page_full": False}
         elif mode == "genre":
             genre_clean = clean_genre(genre)
-            fp_results = []
+            provider_results: Dict[str, List[FilmpalastSearchResult]] = {
+                provider: [] for provider in appconfig.MOVIE_PROVIDER_DEFAULTS
+            }
             if not state.fp_provider_genres or genre_clean in state.fp_provider_genres:
                 scraper = get_fp_scraper()
                 with state.fp_lock:
-                    fp_results = scraper.list_by_genre(genre_clean, page)
-            combined = list(fp_results)
+                    provider_results["filmpalast"] = scraper.list_by_genre(genre_clean, page)
             if page == 1 and genre_clean in state.moflix_provider_genres:
                 try:
-                    combined.extend(MoflixScraper(progress_cb=log).list_by_genre(genre_clean, page))
+                    provider_results["moflix"] = MoflixScraper(progress_cb=log).list_by_genre(genre_clean, page)
                 except Exception as exc:
                     log(f"Moflix Genre übersprungen: {exc}", "warn")
             if page == 1 and genre_clean in state.einschalten_provider_genres:
                 try:
-                    combined.extend(EinschaltenScraper(progress_cb=log).list_by_genre(genre_clean, page))
+                    provider_results["einschalten"] = EinschaltenScraper(progress_cb=log).list_by_genre(genre_clean, page)
                 except Exception as exc:
                     log(f"Einschalten Genre übersprungen: {exc}", "warn")
             if page == 1 and genre_clean in state.kinox_provider_genres:
                 try:
-                    combined.extend(KinoxScraper(progress_cb=log).list_by_genre(genre_clean, page))
+                    provider_results["kinox"] = KinoxScraper(progress_cb=log).list_by_genre(genre_clean, page)
                 except Exception as exc:
                     log(f"Kinox Genre übersprungen: {exc}", "warn")
+            combined = [
+                result
+                for provider in provider_priority("movies")
+                for result in provider_results[provider]
+            ]
             return {"results": combined, "category": "genre", "page": page,
-                    "last_page_full": len(fp_results) >= 32}
+                    "last_page_full": len(provider_results["filmpalast"]) >= 32}
         else:  # "new" / "top"
             results = list_movie_candidates(mode, page)
             return {"results": results, "category": mode, "page": page,
@@ -5189,7 +5316,6 @@ async def api_tmdb_movies(body: MovieMetadataBody):
 @app.get("/api/series")
 async def api_series(mode: str = "search", query: str = "", letter: str = "", page: int = 1):
     def _work():
-        # Serien kommen ausschließlich von serienstream.to.
         if mode == "search":
             q = query.strip()
             if not q:
@@ -5209,14 +5335,14 @@ async def api_series(mode: str = "search", query: str = "", letter: str = "", pa
                     "mode": "search", "page": 1, "last_page_full": False,
                 }
             try:
-                results = _sto_search_series(q)
+                results = search_series_candidates(q)
             except Exception as exc:
-                log(f"serienstream Serien-Suche fehlgeschlagen: {exc}", "warn")
+                log(f"Serien-Suche fehlgeschlagen: {exc}", "warn")
                 results = []
             return {"results": results, "direct_series": None, "mode": "search", "page": 1, "last_page_full": False}
 
-        # Browse-Modi: new = „Neue Staffeln diese Woche", trending = „Meistgesehen
-        # gerade" (= angesagt), alpha = A-Z-Katalog (clientseitig paginiert).
+        # Browse-Rubriken sind Serienstream-spezifisch; die freie Suche und alle
+        # Download-Fallbacks folgen dagegen der konfigurierten Priorität.
         results = []
         try:
             with state.sto_lock:
@@ -5750,6 +5876,13 @@ async def api_download_cancel():
 
 
 # ── Einstellungen ────────────────────────────────────────────────────────────
+
+
+@app.get("/api/updater/status")
+async def api_updater_status(force: bool = False):
+    return await run_in_threadpool(UPDATE_CHECKER.check, force)
+
+
 class SetupCompleteBody(BaseModel):
     save_path: str
     series_path: str = ""
@@ -5913,6 +6046,43 @@ async def api_config_set(body: ConfigBody):
     state.save_path = movie_path
     state.series_path = appconfig.load_series_path()
     return {"save_path": state.save_path, "series_path": state.series_path, "saved": True}
+
+
+class ProviderPriorityBody(BaseModel):
+    movies: List[str]
+    series: List[str]
+
+
+def _provider_priority_payload(saved: bool = False) -> dict:
+    return {
+        "movies": provider_priority("movies"),
+        "series": provider_priority("series"),
+        "labels": PROVIDER_LABELS,
+        "saved": saved,
+    }
+
+
+@app.get("/api/providers/config")
+async def api_provider_priority_get():
+    return _provider_priority_payload()
+
+
+@app.post("/api/providers/config")
+async def api_provider_priority_set(body: ProviderPriorityBody):
+    movie_ids = [str(value).strip().casefold() for value in body.movies]
+    series_ids = [str(value).strip().casefold() for value in body.series]
+    if len(movie_ids) != len(set(movie_ids)) or set(movie_ids) != set(appconfig.MOVIE_PROVIDER_DEFAULTS):
+        raise HTTPException(400, "Die Film-Anbieterliste ist unvollständig oder ungültig.")
+    if len(series_ids) != len(set(series_ids)) or set(series_ids) != set(appconfig.SERIES_PROVIDER_DEFAULTS):
+        raise HTTPException(400, "Die Serien-Anbieterliste ist unvollständig oder ungültig.")
+    if not appconfig.save_provider_priorities(movie_ids, series_ids):
+        raise HTTPException(500, "Anbieter-Prioritäten konnten nicht gespeichert werden.")
+    with state.provider_priority_lock:
+        state.provider_priorities = appconfig.load_provider_priorities()
+    with state.movie_list_cache_lock:
+        state.movie_list_cache.clear()
+    state.fallback_series_cache.clear()
+    return _provider_priority_payload(saved=True)
 
 
 class JellyfinConfigBody(BaseModel):

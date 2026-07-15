@@ -44,6 +44,8 @@ const api = {
 
   configGet() { return this.get("/api/config"); },
   configSet(savePath, seriesPath) { return this.post("/api/config", { save_path: savePath, series_path: seriesPath }); },
+  providerPriorityGet() { return this.get("/api/providers/config"); },
+  providerPrioritySet(cfg) { return this.post("/api/providers/config", cfg); },
 
   jellyfinConfigGet() { return this.get("/api/jellyfin/config"); },
   jellyfinConfigSet(url, apiKey, userId = "", userName = "") {
@@ -59,6 +61,9 @@ const api = {
   seerrConfigGet() { return this.get("/api/seerr/config"); },
   seerrConfigSet(cfg) { return this.post("/api/seerr/config", cfg); },
   seerrSync() { return this.post("/api/seerr/sync"); },
+  updaterStatus(force = false) {
+    return this.get("/api/updater/status?" + new URLSearchParams({ force: String(force) }));
+  },
   browseDir(path) { return this.get("/api/browse-dir?" + new URLSearchParams({ path: path || "" })); },
 
   clearCookies() { return this.post("/api/session/clear-cookies"); },

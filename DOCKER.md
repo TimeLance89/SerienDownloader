@@ -140,6 +140,9 @@ Bei **Weg A** liegen beide direkt im gemounteten Ordner. Bei **Weg B** werden si
 | `DNS_OVERRIDE`      | `1`              | Nur `start.sh`: `0` behält Dockers DNS-Konfiguration unverändert. |
 | `APP_USERNAME`      | leer             | HTTP-Basic-Benutzer für die Weboberfläche. Im LAN setzen. |
 | `APP_PASSWORD`      | leer             | HTTP-Basic-Passwort. Im LAN setzen. |
+| `APP_COMMIT_SHA`    | leer             | Build-Revision für den Updatevergleich; bei einem Git-Checkout wird sie automatisch erkannt. |
+| `UPDATE_GITHUB_REPOSITORY` | `TimeLance89/SerienDownloader` | Repository für die Updateprüfung. |
+| `UPDATE_GITHUB_BRANCH` | `main` | Verglichener Branch. |
 
 ### DNS / Provider-Sperren
 
@@ -184,6 +187,12 @@ Laufzeit bevorzugt von TMDB. Anbieter bleiben ausschließlich Quelle für Suche,
 Hoster und Downloads. Ist TMDB nicht konfiguriert, nicht erreichbar oder findet
 keinen eindeutigen Treffer, werden automatisch die bisherigen Anbieterdaten
 verwendet. Antworten werden pro Film/Serie im Arbeitsspeicher gecacht.
+
+### Anbieter-Priorität
+
+Unter *Einstellungen → Anbieter-Priorität* lässt sich die Reihenfolge getrennt
+für Filme und Serien festlegen. Die erste Quelle wird bevorzugt; Suche,
+automatische Anfragen und Download-Fallbacks verwenden dieselbe Reihenfolge.
 
 ### Telegram-Filmwünsche
 

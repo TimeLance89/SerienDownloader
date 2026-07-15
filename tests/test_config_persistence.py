@@ -65,6 +65,26 @@ class ConfigPersistenceTests(unittest.TestCase):
         self.assertTrue(config.save_seerr_requests(requests))
         self.assertEqual(config.load_seerr_requests(), requests)
 
+    def test_provider_priorities_survive_restart_roundtrip(self):
+        self.assertTrue(config.save_provider_priorities(
+            ["kinox", "moflix", "filmpalast", "einschalten"],
+            ["moflix", "filmpalast", "serienstream"],
+        ))
+        self.assertEqual(config.load_provider_priorities(), {
+            "movies": ["kinox", "moflix", "filmpalast", "einschalten"],
+            "series": ["moflix", "filmpalast", "serienstream"],
+        })
+
+    def test_provider_priorities_repair_unknown_duplicates_and_missing_values(self):
+        self.assertTrue(config.save_provider_priorities(
+            ["moflix", "unknown", "moflix"],
+            ["filmpalast"],
+        ))
+        self.assertEqual(config.load_provider_priorities(), {
+            "movies": ["moflix", "filmpalast", "einschalten", "kinox"],
+            "series": ["filmpalast", "serienstream", "moflix"],
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

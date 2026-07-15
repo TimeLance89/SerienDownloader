@@ -47,8 +47,8 @@ def strip_episode_suffix(title: str) -> str:
 # Wer hier steht wird bei VOE-Ausfall automatisch versucht
 # (in `extractor.HosterAwareExtractor`)
 HOSTER_PRIORITY = [
-    "vidara",
     "voe",
+    "vidara",
     "vidoza",
     "streamtape",
     "doodstream",

@@ -14,6 +14,7 @@ const state = {
   wl: { items: [], selected: new Set(), loaded: false },
   queue: { count: 0, groups: [], loaded: false },
   download: { active: false, percent: 0, completed: 0, total: 0, failed: 0 },
+  providers: { movies: [], series: [], labels: {} },
   queuedSlugs: new Set(),
   jellyfinUserConfigured: false,
 };
@@ -1441,6 +1442,44 @@ async function loadJellyfinUsers({ urlId, keyId, selectId, buttonId, statusId = 
   }
 }
 
+function renderProviderPriority(mediaType) {
+  const list = document.getElementById(mediaType === "movies" ? "movie-provider-priority" : "series-provider-priority");
+  const providers = state.providers[mediaType] || [];
+  list.innerHTML = providers.map((provider, index) => `
+    <li class="provider-priority-item" data-provider="${escapeHtml(provider)}">
+      <span class="provider-position">${String(index + 1).padStart(2, "0")}</span>
+      <span class="provider-name">${escapeHtml(state.providers.labels[provider] || provider)}</span>
+      <span class="provider-order-actions">
+        <button class="provider-order-button" type="button" data-direction="-1"
+          aria-label="${escapeHtml(state.providers.labels[provider] || provider)} nach oben"
+          ${index === 0 ? "disabled" : ""}>↑</button>
+        <button class="provider-order-button" type="button" data-direction="1"
+          aria-label="${escapeHtml(state.providers.labels[provider] || provider)} nach unten"
+          ${index === providers.length - 1 ? "disabled" : ""}>↓</button>
+      </span>
+    </li>
+  `).join("");
+  list.querySelectorAll(".provider-order-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = button.closest(".provider-priority-item");
+      const from = state.providers[mediaType].indexOf(item.dataset.provider);
+      const to = from + Number(button.dataset.direction);
+      if (from < 0 || to < 0 || to >= state.providers[mediaType].length) return;
+      [state.providers[mediaType][from], state.providers[mediaType][to]] =
+        [state.providers[mediaType][to], state.providers[mediaType][from]];
+      renderProviderPriority(mediaType);
+    });
+  });
+}
+
+function applyProviderPriority(cfg) {
+  state.providers.movies = [...(cfg.movies || [])];
+  state.providers.series = [...(cfg.series || [])];
+  state.providers.labels = { ...(cfg.labels || {}) };
+  renderProviderPriority("movies");
+  renderProviderPriority("series");
+}
+
 async function initSettings() {
   const cfg = await api.configGet();
   document.getElementById("save-path").value = cfg.save_path;
@@ -1463,6 +1502,8 @@ async function initSettings() {
   applySeerrCfg(seerr);
   const telegram = await api.telegramConfigGet();
   applyTelegramCfg(telegram);
+  applyProviderPriority(await api.providerPriorityGet());
+  checkForUpdates(false);
 }
 
 function applySeerrCfg(cfg) {
@@ -1525,6 +1566,81 @@ function applyAutomationCfg(auto) {
   }
 }
 
+function shortRevision(value) {
+  const revision = String(value || "").trim();
+  return revision ? revision.slice(0, 8) : "unbekannt";
+}
+
+function applyUpdaterStatus(data) {
+  const card = document.getElementById("updater-card");
+  const status = document.getElementById("updater-status");
+  const detail = document.getElementById("updater-detail");
+  const badge = document.getElementById("updater-badge");
+  const repository = document.getElementById("updater-repository");
+  document.getElementById("updater-current").textContent = shortRevision(data.current_sha);
+  document.getElementById("updater-latest").textContent = shortRevision(data.latest_sha);
+  document.getElementById("updater-branch-label").textContent = `GitHub · ${data.branch || "main"}`;
+  if (String(data.repository_url || "").startsWith("https://github.com/")) {
+    repository.href = data.repository_url;
+  }
+
+  if (data.error) {
+    card.dataset.state = "error";
+    badge.textContent = "!";
+    status.textContent = "GitHub-Prüfung fehlgeschlagen";
+    detail.textContent = data.error;
+    return;
+  }
+  if (data.update_available === true) {
+    const commits = Number(data.ahead_by || 0);
+    card.dataset.state = "available";
+    badge.textContent = "↑";
+    status.textContent = "Update verfügbar";
+    detail.textContent = commits
+      ? `${commits} ${commits === 1 ? "neuer Commit" : "neue Commits"} auf ${data.branch || "main"}`
+      : `Neuer Stand auf ${data.branch || "main"}`;
+    return;
+  }
+  if (data.comparison === "identical") {
+    card.dataset.state = "current";
+    badge.textContent = "✓";
+    status.textContent = "Auf dem neuesten Stand";
+    detail.textContent = data.latest_message || "Lokaler Build und GitHub stimmen überein.";
+    return;
+  }
+  if (data.comparison === "behind") {
+    card.dataset.state = "current";
+    badge.textContent = "DEV";
+    status.textContent = "Lokaler Entwicklungsstand";
+    detail.textContent = "Dieser Build liegt vor dem Main-Branch.";
+    return;
+  }
+  card.dataset.state = "unknown";
+  badge.textContent = "?";
+  status.textContent = "Repository erreichbar";
+  detail.textContent = data.current_sha
+    ? "Der lokale Stand konnte nicht eindeutig mit main verglichen werden."
+    : "Lokale Build-ID fehlt; APP_COMMIT_SHA kann sie beim Containerstart setzen.";
+}
+
+async function checkForUpdates(force = false) {
+  const button = document.getElementById("updater-check");
+  const card = document.getElementById("updater-card");
+  const status = document.getElementById("updater-status");
+  const detail = document.getElementById("updater-detail");
+  button.disabled = true;
+  card.dataset.state = "checking";
+  status.textContent = "Prüfe GitHub …";
+  detail.textContent = "Neuester Stand wird geladen.";
+  try {
+    applyUpdaterStatus(await api.updaterStatus(force));
+  } catch (error) {
+    applyUpdaterStatus({ error: error.message });
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function saveAllSettings() {
   const btn = document.getElementById("settings-save");
   const status = document.getElementById("settings-saved-status");
@@ -1539,6 +1655,10 @@ async function saveAllSettings() {
       document.getElementById("save-path").value.trim(),
       document.getElementById("series-path").value.trim(),
     );
+    applyProviderPriority(await api.providerPrioritySet({
+      movies: state.providers.movies,
+      series: state.providers.series,
+    }));
     const jfUserSelect = document.getElementById("jellyfin-user-id");
     const jfConfig = await api.jellyfinConfigSet(
       document.getElementById("jellyfin-url").value.trim(),
@@ -1904,6 +2024,7 @@ async function initApp() {
   });
   document.getElementById("settings-btn").addEventListener("click", () => switchTab("einstellungen"));
   document.getElementById("settings-save").addEventListener("click", saveAllSettings);
+  document.getElementById("updater-check").addEventListener("click", () => checkForUpdates(true));
   document.getElementById("seerr-sync").addEventListener("click", async () => {
     const button = document.getElementById("seerr-sync");
     const status = document.getElementById("seerr-status");

@@ -196,7 +196,7 @@ class ServerSeerrTests(unittest.TestCase):
         candidate = SimpleNamespace(
             title="Die Serie", year="1999", sample_slug="die-serie/staffel-1/episode-1",
         )
-        with patch.object(server, "_sto_search_series", return_value=[candidate]), patch.object(
+        with patch.object(server, "search_series_candidates", return_value=[candidate]), patch.object(
             server, "get_series_for_value",
         ) as load_series:
             with self.assertRaisesRegex(RuntimeError, "abweichendes Erscheinungsjahr"):
@@ -208,7 +208,7 @@ class ServerSeerrTests(unittest.TestCase):
             title="Die Serie  [S.to]", year="", sample_slug="die-serie/staffel-1/episode-1",
         )
         tmdb = SimpleNamespace(series_matches_id=Mock(return_value=False))
-        with patch.object(server, "_sto_search_series", return_value=[candidate]), patch.object(
+        with patch.object(server, "search_series_candidates", return_value=[candidate]), patch.object(
             server, "get_tmdb_client", return_value=tmdb,
         ), patch.object(server, "get_series_for_value") as load_series:
             with self.assertRaisesRegex(RuntimeError, "TMDB-ID"):

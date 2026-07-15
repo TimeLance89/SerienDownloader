@@ -1,6 +1,9 @@
 services:
   seriendownloader:
-    build: .
+    build:
+      context: .
+      args:
+        APP_COMMIT_SHA: ${APP_COMMIT_SHA:-}
     image: seriendownloader:latest
     container_name: seriendownloader
     ports:
@@ -48,6 +51,8 @@ services:
       SEERR_URL: ${SEERR_URL:-http://seerr:5055}
       SEERR_API_KEY: ${SEERR_API_KEY:-}
       SEERR_POLL_INTERVAL_SECONDS: ${SEERR_POLL_INTERVAL_SECONDS:-60}
+      UPDATE_GITHUB_REPOSITORY: ${UPDATE_GITHUB_REPOSITORY:-TimeLance89/SerienDownloader}
+      UPDATE_GITHUB_BRANCH: ${UPDATE_GITHUB_BRANCH:-main}
       AUTO_DOWNLOAD: ${AUTO_DOWNLOAD:-false}
       CHECK_INTERVAL_MIN: ${CHECK_INTERVAL_MIN:-30}
       DL_WINDOW_START: ${DL_WINDOW_START:-}

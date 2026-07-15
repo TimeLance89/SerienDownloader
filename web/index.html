@@ -242,6 +242,39 @@
           </div>
         </div>
 
+        <div class="settings-group provider-settings">
+          <div class="provider-heading">
+            <div>
+              <span class="provider-kicker">DOWNLOAD · ROUTING</span>
+              <h3>Anbieter-Priorität</h3>
+              <p class="dim settings-hint">Position 1 wird zuerst genutzt. Ist eine Quelle nicht verfügbar, folgt automatisch die nächste.</p>
+            </div>
+            <span class="provider-route-mark" aria-hidden="true">1→N</span>
+          </div>
+          <div class="provider-priority-grid">
+            <section class="provider-priority-card" aria-labelledby="movie-provider-title">
+              <div class="provider-card-heading">
+                <span class="provider-media-mark" aria-hidden="true">F</span>
+                <div>
+                  <h4 id="movie-provider-title">Filme</h4>
+                  <span class="dim">Primärquelle &amp; Fallbacks</span>
+                </div>
+              </div>
+              <ol id="movie-provider-priority" class="provider-priority-list" aria-label="Anbieter-Priorität für Filme"></ol>
+            </section>
+            <section class="provider-priority-card" aria-labelledby="series-provider-title">
+              <div class="provider-card-heading">
+                <span class="provider-media-mark is-series" aria-hidden="true">S</span>
+                <div>
+                  <h4 id="series-provider-title">Serien</h4>
+                  <span class="dim">Primärquelle &amp; Fallbacks</span>
+                </div>
+              </div>
+              <ol id="series-provider-priority" class="provider-priority-list" aria-label="Anbieter-Priorität für Serien"></ol>
+            </section>
+          </div>
+        </div>
+
         <div class="settings-group">
           <h3>Jellyfin (NAS)</h3>
           <p class="dim settings-hint">Vorhandene Folgen werden übersprungen. Ein Wiedergabeprofil steuert Abos nach Gesehen-Status.</p>
@@ -349,6 +382,38 @@
           </div>
           <p class="telegram-setup dim">Einrichtung: Bot bei @BotFather anlegen → Token eintragen → aktivieren und speichern → dem Bot <code>/start</code> senden. Ohne Chat-ID antwortet er nur mit deiner ID und startet keine Downloads.</p>
           <div id="telegram-status" class="dim small-status">—</div>
+        </div>
+
+        <div id="updater-card" class="settings-group updater-settings" data-state="idle">
+          <div class="updater-heading">
+            <div>
+              <span class="updater-kicker">SYSTEM · GITHUB</span>
+              <h3>Updates</h3>
+              <p class="dim settings-hint">Vergleicht diesen Build mit dem neuesten Stand auf dem Main-Branch.</p>
+            </div>
+            <span id="updater-badge" class="updater-badge" aria-hidden="true">GH</span>
+          </div>
+          <div class="updater-track" aria-label="Installierter und neuester Build">
+            <div class="updater-revision">
+              <span>Installiert</span>
+              <code id="updater-current">—</code>
+            </div>
+            <span class="updater-track-line" aria-hidden="true"><i></i></span>
+            <div class="updater-revision is-remote">
+              <span id="updater-branch-label">GitHub · main</span>
+              <code id="updater-latest">—</code>
+            </div>
+          </div>
+          <div class="updater-actions">
+            <div>
+              <strong id="updater-status" role="status" aria-live="polite">Noch nicht geprüft</strong>
+              <span id="updater-detail" class="dim">Die Prüfung verändert keine Dateien.</span>
+            </div>
+            <button id="updater-check" class="btn btn-ghost btn-sm" type="button">Auf Updates prüfen</button>
+          </div>
+          <a id="updater-repository" class="updater-repository" href="https://github.com/TimeLance89/SerienDownloader" target="_blank" rel="noopener noreferrer">
+            Repository öffnen <span aria-hidden="true">↗</span>
+          </a>
         </div>
 
         <div class="settings-actions">
