@@ -455,6 +455,25 @@ function setActiveGenreFilter(genre) {
   });
 }
 
+function scrollCatalogToStart(tabId, resultsId) {
+  const tab = document.getElementById(tabId);
+  const results = document.getElementById(resultsId);
+  const panel = results?.closest(".results-panel");
+  if (!tab || !results || !panel) return;
+
+  results.scrollTop = 0;
+  results.scrollLeft = 0;
+  if (window.matchMedia("(max-width: 820px)").matches) {
+    const topbarHeight = document.querySelector(".topbar")?.getBoundingClientRect().height || 0;
+    const targetTop = window.scrollY + panel.getBoundingClientRect().top - topbarHeight - 14;
+    window.scrollTo({ top: Math.max(0, targetTop), behavior: "auto" });
+    return;
+  }
+
+  const targetTop = tab.scrollTop + panel.getBoundingClientRect().top - tab.getBoundingClientRect().top;
+  tab.scrollTo({ top: Math.max(0, targetTop - 8), behavior: "auto" });
+}
+
 async function refreshFpJellyfinStatus() {
   const items = state.fp.results.map((r) => ({
     slug: r.slug,
@@ -959,6 +978,7 @@ async function fpPagerChange(delta) {
     const data = await api.movies(params);
     if (requestId !== state.fp.requestSeq) return;
     applyFpResults(data);
+    scrollCatalogToStart("tab-filme", "fp-results");
   } catch (error) {
     if (requestId !== state.fp.requestSeq) return;
     document.getElementById("fp-status").textContent =
@@ -1356,7 +1376,9 @@ async function seriesPagerChange(delta) {
   if (!mode || mode === "search") return;
   const newPage = state.series.page + delta;
   if (newPage < 1) return;
-  await seriesBrowse(mode, newPage);
+  if (await seriesBrowse(mode, newPage)) {
+    scrollCatalogToStart("tab-serien", "series-results");
+  }
 }
 
 async function loadSeries(result) {
