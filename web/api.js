@@ -92,5 +92,12 @@ const api = {
   watchlistCheck(baseSlugs) { return this.post("/api/watchlist/check", { base_slugs: baseSlugs || null }); },
   watchlistOpen(baseSlug) { return this.post("/api/watchlist/open", { base_slug: baseSlug }); },
 
-  coverUrl(url) { return url ? "/api/cover?" + new URLSearchParams({ url }) : ""; },
+  coverUrl(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url, location.origin);
+      if (parsed.protocol === "https:" && parsed.hostname === "image.tmdb.org") return parsed.href;
+    } catch (e) { /* Ungültige Anbieter-URL wird vom Proxy abgewiesen. */ }
+    return "/api/cover?" + new URLSearchParams({ url });
+  },
 };

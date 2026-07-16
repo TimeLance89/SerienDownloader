@@ -128,6 +128,7 @@ MOVIE_LIST_CACHE_MAX_ENTRIES = 1000
 MOVIE_MAX_GLOBAL_PAGE = 50
 MOVIE_MAX_SOURCE_PAGE = 50
 MOVIE_MAX_COLD_WAVES_PER_REQUEST = 2
+TMDB_MOVIE_BATCH_MAX_WORKERS = 8
 SERIES_BROWSE_PAGE_SIZE = 32
 SERIES_PAGINATED_PROVIDERS = frozenset({"filmpalast", "megakino", "kinoger", "xcine"})
 SERIES_ALPHA_PROVIDERS = frozenset({"serienstream", "filmpalast"})
@@ -6499,7 +6500,7 @@ async def api_tmdb_movies(body: MovieMetadataBody):
 
         result = {}
         groups = list(unique.values())
-        with ThreadPoolExecutor(max_workers=min(4, len(groups))) as pool:
+        with ThreadPoolExecutor(max_workers=min(TMDB_MOVIE_BATCH_MAX_WORKERS, len(groups))) as pool:
             futures = [(group, pool.submit(get_tmdb_client().movie_summary, group["title"], group["year"])) for group in groups]
             for group, future in futures:
                 try:

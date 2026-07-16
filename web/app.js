@@ -47,6 +47,8 @@ const WATCH_CLEANUP_LABELS = {
   watched_seasons: "Staffel-Löschung",
   watched_episodes: "Episoden-Löschung",
 };
+const FP_METADATA_BATCH_SIZE = 4;
+const FP_METADATA_BATCH_CONCURRENCY = 3;
 let watchModeContext = null;
 let watchModeReturnFocus = null;
 
@@ -845,20 +847,43 @@ async function preloadTmdbMetadata(requestId) {
     return;
   }
   const visibleSlugs = new Set(items.map((item) => item.slug));
-  try {
-    const response = await api.tmdbMovies(items);
-    if (requestId !== state.fp.requestSeq) return;
-    for (const [slug, metadata] of Object.entries(response.movies || {})) {
-      if (visibleSlugs.has(slug)) {
-        state.fp.metadataCache[slug] = metadata;
+  const batches = [];
+  for (let index = 0; index < items.length; index += FP_METADATA_BATCH_SIZE) {
+    batches.push(items.slice(index, index + FP_METADATA_BATCH_SIZE));
+  }
+  let nextBatch = 0;
+
+  const loadNextBatch = async () => {
+    while (nextBatch < batches.length) {
+      const batch = batches[nextBatch++];
+      let response;
+      try {
+        response = await api.tmdbMovies(batch);
+      } catch (e) {
+        continue;
+      }
+      if (requestId !== state.fp.requestSeq) return;
+      for (const [slug, metadata] of Object.entries(response.movies || {})) {
+        if (!visibleSlugs.has(slug)) continue;
+        if (!state.fp.metadataCache[slug]?.details_loaded) {
+          state.fp.metadataCache[slug] = metadata;
+        }
+        state.fp.pendingPreload?.delete(slug);
         updateFpResultCard(slug);
       }
+      const selected = state.fp.selectedSlug;
+      if (selected && batch.some((item) => item.slug === selected)
+          && !state.fp.moviesCache[selected] && state.fp.metadataCache[selected]) {
+        showFpDetail(selected, metadataPreviewMovie(state.fp.metadataCache[selected]), true);
+      }
     }
+  };
+
+  try {
+    const workerCount = Math.min(FP_METADATA_BATCH_CONCURRENCY, batches.length);
+    await Promise.all(Array.from({ length: workerCount }, () => loadNextBatch()));
+    if (requestId !== state.fp.requestSeq) return;
     refreshFpJellyfinStatus();
-    const selected = state.fp.selectedSlug;
-    if (selected && visibleSlugs.has(selected) && !state.fp.moviesCache[selected] && state.fp.metadataCache[selected]) {
-      showFpDetail(selected, metadataPreviewMovie(state.fp.metadataCache[selected]), true);
-    }
   } catch (e) { /* Anbieter-Metadaten bleiben als Fallback sichtbar. */ }
   finally {
     if (requestId !== state.fp.requestSeq) return;
