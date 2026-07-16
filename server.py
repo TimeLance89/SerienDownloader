@@ -25,7 +25,7 @@ import requests
 from contextlib import asynccontextmanager
 from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
@@ -121,6 +121,15 @@ MOVIE_LIST_CACHE_MAX_ENTRIES = 1000
 MOVIE_MAX_GLOBAL_PAGE = 50
 MOVIE_MAX_SOURCE_PAGE = 50
 MOVIE_MAX_COLD_WAVES_PER_REQUEST = 2
+SERIES_BROWSE_PAGE_SIZE = 32
+SERIES_PAGINATED_PROVIDERS = frozenset({"filmpalast", "megakino", "kinoger", "xcine"})
+SERIES_ALPHA_PROVIDERS = frozenset({"serienstream", "filmpalast"})
+SERIES_LIST_CACHE_TTL = 300
+SERIES_LIST_FAILURE_CACHE_TTL = 30
+SERIES_LIST_CACHE_MAX_ENTRIES = 500
+SERIES_MAX_GLOBAL_PAGE = 50
+SERIES_MAX_SOURCE_PAGE = 50
+SERIES_MAX_COLD_WAVES_PER_REQUEST = 2
 
 
 def _authorized_header(value: str) -> bool:
@@ -207,6 +216,9 @@ class AppState:
         self.fp_movies: Dict[str, FilmpalastMovie] = {}
         self.movie_list_cache: Dict[tuple, tuple] = {}
         self.movie_list_cache_lock = threading.Lock()
+        self.series_list_cache: Dict[tuple, tuple] = {}
+        self.series_list_cache_lock = threading.Lock()
+        self.series_catalog_lock = threading.Lock()
         self.picked: set = set(appconfig.load_queue())
         self.queue_content_keys: Dict[str, str] = {}
         self.done_slugs: set = set()
@@ -1159,7 +1171,7 @@ def list_movie_candidates(mode: str, page: int = 1) -> List[FilmpalastSearchResu
 
 
 def warm_home_movie_cache():
-    """Bereitet die Startansicht vor, bevor der erste Browser sie anfordert."""
+    """Bereitet Film- und Serien-Startansicht vor dem ersten Browser vor."""
     try:
         movies = list_movie_candidates("new", 1)
         tmdb = get_tmdb_client()
@@ -1186,6 +1198,8 @@ def warm_home_movie_cache():
         log(f"Startansicht vorbereitet: {len(movies)} neue Filme.")
     except Exception as exc:
         log(f"Startansicht konnte nicht vorab geladen werden: {exc}", "warn")
+    finally:
+        warm_home_series_cache()
 
 
 # --- Serienanbieter ----------------------------------------------------------
@@ -1233,25 +1247,503 @@ def _load_series_for_provider(provider: str, value: str) -> Optional[FilmpalastS
     return None
 
 
-def search_series_candidates(query: str) -> List[FilmpalastSeriesResult]:
-    """Durchsucht alle Serienkataloge und behält die konfigurierte Reihenfolge."""
+def _search_series_provider_results(
+    query: str,
+) -> Dict[str, List[FilmpalastSeriesResult]]:
+    """Durchsucht alle Serienkataloge parallel und trennt die Treffer je Quelle."""
     q = query.strip()
     if not q:
-        return []
+        return {}
     priority = provider_priority("series")
     tasks = [
         (provider, lambda key=provider: _search_series_for_provider(key, q))
         for provider in priority
     ]
-    results: List[FilmpalastSeriesResult] = []
+    provider_results: Dict[str, List[FilmpalastSeriesResult]] = {}
     with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
         futures = [(provider, pool.submit(fn)) for provider, fn in tasks]
         for provider, future in futures:
             try:
-                results.extend(future.result())
+                provider_results[provider] = list(future.result())
             except Exception as exc:
                 log(f"{PROVIDER_LABELS[provider]} Seriensuche übersprungen: {exc}", "warn")
+                provider_results[provider] = []
+    return provider_results
+
+
+def search_series_candidates(query: str) -> List[FilmpalastSeriesResult]:
+    """Durchsucht alle Serienkataloge und behält die konfigurierte Reihenfolge."""
+    provider_results = _search_series_provider_results(query)
+    results: List[FilmpalastSeriesResult] = []
+    for provider in provider_priority("series"):
+        results.extend(provider_results.get(provider, []))
     return results
+
+
+@dataclass(frozen=True)
+class _SeriesCatalogEntry:
+    """Ein sichtbarer Serientreffer mit bevorzugter und alternativen Quellen."""
+
+    provider: str
+    result: FilmpalastSeriesResult
+    providers: tuple[str, ...]
+
+
+class SeriesCatalogColdLoadLimit(RuntimeError):
+    """Verhindert teure Sprünge über viele noch ungecachte Serienseiten."""
+
+
+def _series_result_identity(
+    result: FilmpalastSeriesResult,
+    provider: str,
+    years_by_title: Dict[str, set[str]],
+) -> tuple:
+    title_key = _norm_title(strip_source_suffix(result.title))
+    if not title_key:
+        return ("source", provider, str(result.base_slug or result.sample_slug or result.sample_url))
+    year = str(result.year or "").strip()
+    known_years = years_by_title.get(title_key, set())
+    if not year and len(known_years) == 1:
+        year = next(iter(known_years))
+    return ("series", title_key, year)
+
+
+def _claim_series_identity(identity: tuple, claimed: set[tuple]) -> bool:
+    """Reserviert eine Identität; True bedeutet, dass sie bereits sichtbar ist."""
+    if identity in claimed:
+        return True
+    if len(identity) != 3 or identity[0] != "series":
+        claimed.add(identity)
+        return False
+
+    _kind, title_key, year = identity
+    unknown = ("series", title_key, "")
+    known = {
+        item for item in claimed
+        if len(item) == 3 and item[0] == "series" and item[1] == title_key and item[2]
+    }
+    if year and unknown in claimed:
+        # Ein früher jahrsloser Treffer wird durch den ersten eindeutigen
+        # Jahrgang konkretisiert. Weitere Remakes dürfen danach sichtbar bleiben.
+        claimed.remove(unknown)
+        claimed.add(identity)
+        return True
+    if not year and len(known) == 1:
+        return True
+    claimed.add(identity)
+    return False
+
+
+def _mix_series_provider_results(
+    provider_results: Dict[str, List[FilmpalastSeriesResult]],
+    priority: List[str],
+    claimed_identities: Optional[set[tuple]] = None,
+) -> List[_SeriesCatalogEntry]:
+    """Dedupliziert Serien und mischt die Leitquelle im Verhältnis 2:1 ein.
+
+    Die erste konfigurierte Quelle erhält zwei Plätze je Runde. So bleibt die
+    stärkste Quelle prägend, während jeder weitere Anbieter regelmäßig sichtbar
+    wird. Identische Titel werden als eine Serie mit mehreren Quellen geführt.
+    """
+    years_by_title: Dict[str, set[str]] = defaultdict(set)
+    for results in provider_results.values():
+        for result in results:
+            title_key = _norm_title(strip_source_suffix(result.title))
+            year = str(result.year or "").strip()
+            if title_key and year:
+                years_by_title[title_key].add(year)
+
+    grouped: Dict[tuple, List[tuple[str, FilmpalastSeriesResult]]] = OrderedDict()
+    for provider in priority:
+        for result in provider_results.get(provider, []):
+            identity = _series_result_identity(result, provider, years_by_title)
+            grouped.setdefault(identity, []).append((provider, result))
+
+    seen = claimed_identities if claimed_identities is not None else set()
+    per_provider: Dict[str, List[_SeriesCatalogEntry]] = {provider: [] for provider in priority}
+    for identity, matches in grouped.items():
+        if _claim_series_identity(identity, seen):
+            continue
+        primary_provider, primary_result = matches[0]
+        source_set = {provider for provider, _result in matches}
+        sources = tuple(provider for provider in priority if provider in source_set)
+
+        # Fehlende Listenmetadaten dürfen von einer alternativen Quelle ergänzt
+        # werden, ohne die bevorzugte, klickbare Quelle auszutauschen.
+        year = str(primary_result.year or "").strip()
+        cover_url = str(primary_result.cover_url or "").strip()
+        if not year:
+            year = next((str(result.year).strip() for _provider, result in matches if result.year), "")
+        if not cover_url:
+            cover_url = next(
+                (str(result.cover_url).strip() for _provider, result in matches if result.cover_url),
+                "",
+            )
+        visible_result = replace(primary_result, year=year, cover_url=cover_url)
+        per_provider[primary_provider].append(_SeriesCatalogEntry(
+            provider=primary_provider,
+            result=visible_result,
+            providers=sources or (primary_provider,),
+        ))
+
+    mixed: List[_SeriesCatalogEntry] = []
+    positions = {provider: 0 for provider in priority}
+    while True:
+        progressed = False
+        for index, provider in enumerate(priority):
+            quota = 2 if index == 0 else 1
+            entries = per_provider[provider]
+            start = positions[provider]
+            end = min(start + quota, len(entries))
+            if end > start:
+                mixed.extend(entries[start:end])
+                positions[provider] = end
+                progressed = True
+        if not progressed:
+            break
+    return mixed
+
+
+def _interleave_series_lists(
+    *lists: List[FilmpalastSeriesResult],
+) -> List[FilmpalastSeriesResult]:
+    """Verzahnt mehrere Signallisten stabil und entfernt Quell-Dubletten."""
+    merged: List[FilmpalastSeriesResult] = []
+    seen: set[str] = set()
+    longest = max((len(items) for items in lists), default=0)
+    for index in range(longest):
+        for items in lists:
+            if index >= len(items):
+                continue
+            result = items[index]
+            key = str(result.base_slug or result.sample_slug or result.sample_url or result.title)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(result)
+    return merged
+
+
+def _series_provider_is_paginated(provider: str, mode: str) -> bool:
+    if mode == "alpha":
+        return provider in SERIES_ALPHA_PROVIDERS
+    return provider in SERIES_PAGINATED_PROVIDERS
+
+
+def _cached_series_provider_page(
+    cache_key: tuple,
+) -> Optional[List[FilmpalastSeriesResult]]:
+    with state.series_list_cache_lock:
+        cached = state.series_list_cache.get(cache_key)
+        ttl = cached[2] if cached and len(cached) > 2 else SERIES_LIST_CACHE_TTL
+        if cached and time.time() - cached[0] < ttl:
+            return list(cached[1])
+        if cached:
+            state.series_list_cache.pop(cache_key, None)
+    return None
+
+
+def _cache_series_provider_page(
+    cache_key: tuple,
+    results: List[FilmpalastSeriesResult],
+    ttl: int = SERIES_LIST_CACHE_TTL,
+) -> None:
+    now = time.time()
+    with state.series_list_cache_lock:
+        expired = [
+            key for key, cached in state.series_list_cache.items()
+            if now - cached[0] >= (
+                cached[2] if len(cached) > 2 else SERIES_LIST_CACHE_TTL
+            )
+        ]
+        for key in expired:
+            state.series_list_cache.pop(key, None)
+        while len(state.series_list_cache) >= SERIES_LIST_CACHE_MAX_ENTRIES:
+            oldest = min(
+                state.series_list_cache,
+                key=lambda key: state.series_list_cache[key][0],
+            )
+            state.series_list_cache.pop(oldest, None)
+        state.series_list_cache[cache_key] = (now, list(results), ttl)
+
+
+def _fetch_series_provider_page(
+    provider: str,
+    mode: str,
+    letter: str,
+    source_page: int,
+) -> List[FilmpalastSeriesResult]:
+    """Lädt eine Serien-Quellseite passend zum gewünschten Entdeckungsmodus."""
+    if not _series_provider_is_paginated(provider, mode) and source_page != 1:
+        return []
+
+    if provider == "serienstream":
+        with state.sto_lock:
+            scraper = get_sto_scraper()
+            if mode == "alpha":
+                return list(scraper.list_series_alpha(letter, source_page))
+            if source_page != 1:
+                return []
+            if mode == "new":
+                return list(scraper.list_new(1))
+            if mode == "trending":
+                return list(scraper.list_trending(1))
+            return _interleave_series_lists(
+                list(scraper.list_trending(1)),
+                list(scraper.list_new(1)),
+            )
+
+    if provider == "filmpalast":
+        with state.fp_lock:
+            scraper = get_fp_scraper()
+            if mode == "alpha":
+                return list(scraper.list_series_alpha(letter, source_page))
+            return list(scraper.list_series(source_page))
+
+    if mode == "alpha":
+        return []
+    scraper_classes = {
+        "moflix": MoflixScraper,
+        "kinoger": KinogerScraper,
+        "megakino": MegaKinoScraper,
+        "xcine": XcineScraper,
+    }
+    scraper_class = scraper_classes.get(provider)
+    if scraper_class is None:
+        return []
+    return list(scraper_class(progress_cb=log).list_series(source_page))
+
+
+def _load_series_provider_pages(
+    mode: str,
+    letter: str,
+    requests_to_load: List[tuple[str, int]],
+    cold_wave_budget: Optional[List[int]] = None,
+) -> Dict[tuple[str, int], List[FilmpalastSeriesResult]]:
+    loaded: Dict[tuple[str, int], List[FilmpalastSeriesResult]] = {}
+    missing: List[tuple[str, int, tuple]] = []
+    letter_key = str(letter or "").strip().upper()
+    for provider, source_page in dict.fromkeys(requests_to_load):
+        cache_mode = (
+            "updates"
+            if provider != "serienstream" and mode in {"discover", "new"}
+            else mode
+        )
+        cache_key = ("series-provider", cache_mode, letter_key, provider, int(source_page))
+        cached = _cached_series_provider_page(cache_key)
+        if cached is None:
+            missing.append((provider, source_page, cache_key))
+        else:
+            loaded[(provider, source_page)] = cached
+
+    if not missing:
+        return loaded
+    if cold_wave_budget is not None:
+        if cold_wave_budget[0] <= 0:
+            raise SeriesCatalogColdLoadLimit(
+                "Diese Serienseite ist noch nicht vorbereitet. Bitte über ‚Weiter‘ schrittweise öffnen."
+            )
+        cold_wave_budget[0] -= 1
+
+    with ThreadPoolExecutor(max_workers=min(len(missing), len(PROVIDER_LABELS))) as pool:
+        futures = [
+            (
+                provider,
+                source_page,
+                cache_key,
+                pool.submit(
+                    _fetch_series_provider_page,
+                    provider,
+                    mode,
+                    letter,
+                    source_page,
+                ),
+            )
+            for provider, source_page, cache_key in missing
+        ]
+        for provider, source_page, cache_key, future in futures:
+            try:
+                results = list(future.result())
+            except Exception as exc:
+                log(
+                    f"{PROVIDER_LABELS.get(provider, provider)} Serienliste "
+                    f"(Quellseite {source_page}) übersprungen: {exc}",
+                    "warn",
+                )
+                results = []
+                _cache_series_provider_page(
+                    cache_key,
+                    results,
+                    ttl=SERIES_LIST_FAILURE_CACHE_TTL,
+                )
+            else:
+                _cache_series_provider_page(cache_key, results)
+            loaded[(provider, source_page)] = results
+    return loaded
+
+
+def _series_catalog_sources(entries: List[_SeriesCatalogEntry], priority: List[str]) -> List[dict]:
+    counts = Counter(provider for entry in entries for provider in entry.providers)
+    return [
+        {"key": provider, "label": PROVIDER_LABELS[provider], "count": counts[provider]}
+        for provider in priority
+        if counts[provider]
+    ]
+
+
+def _series_entry_to_dict(entry: _SeriesCatalogEntry) -> dict:
+    payload = asdict(entry.result)
+    payload["title"] = strip_source_suffix(entry.result.title)
+    payload["provider"] = entry.provider
+    payload["provider_label"] = PROVIDER_LABELS.get(entry.provider, entry.provider)
+    payload["sources"] = [
+        {"key": provider, "label": PROVIDER_LABELS.get(provider, provider)}
+        for provider in entry.providers
+    ]
+    return payload
+
+
+def _series_catalog_page_locked(mode: str, page: int = 1, letter: str = "") -> dict:
+    """Erzeugt eine stabile, gemischte Serienseite aus den verfügbaren Katalogen."""
+    page = max(1, min(int(page), SERIES_MAX_GLOBAL_PAGE))
+    mode = mode if mode in {"discover", "new", "trending", "alpha"} else "discover"
+    priority = provider_priority("series")
+    if mode == "trending":
+        # Nur Serienstream liefert ein echtes Popularitätssignal. Andere
+        # Aktualitätslisten werden bewusst nicht als „angesagt“ ausgegeben.
+        active = [provider for provider in priority if provider == "serienstream"]
+    elif mode == "alpha":
+        active = [provider for provider in priority if provider in SERIES_ALPHA_PROVIDERS]
+    else:
+        active = list(priority)
+
+    provider_seen: Dict[str, set[str]] = {provider: set() for provider in priority}
+
+    def unique_page(
+        provider: str,
+        results: List[FilmpalastSeriesResult],
+    ) -> List[FilmpalastSeriesResult]:
+        unique: List[FilmpalastSeriesResult] = []
+        for result in results:
+            source_key = str(
+                result.base_slug or result.sample_slug or result.sample_url or result.title
+            ).strip()
+            key = f"{source_key}\0{str(result.year or '').strip()}"
+            if key in provider_seen[provider]:
+                continue
+            provider_seen[provider].add(key)
+            unique.append(result)
+        return unique
+
+    cold_wave_budget = [SERIES_MAX_COLD_WAVES_PER_REQUEST]
+    first_pages = _load_series_provider_pages(
+        mode,
+        letter,
+        [(provider, 1) for provider in active],
+        cold_wave_budget,
+    )
+    first_wave = {
+        provider: unique_page(provider, first_pages.get((provider, 1), []))
+        for provider in active
+    }
+    claimed_identities: set[tuple] = set()
+    catalog_entries = _mix_series_provider_results(
+        first_wave,
+        priority,
+        claimed_identities,
+    )
+
+    paginated = [
+        provider for provider in active if _series_provider_is_paginated(provider, mode)
+    ]
+    exhausted = {provider for provider in paginated if not first_wave[provider]}
+    duplicate_only_pages = {provider: 0 for provider in paginated}
+    target_end = page * SERIES_BROWSE_PAGE_SIZE
+    next_source_page = 2
+    has_more_unverified = False
+
+    while len(catalog_entries) <= target_end and next_source_page <= SERIES_MAX_SOURCE_PAGE:
+        pending = [provider for provider in paginated if provider not in exhausted]
+        if not pending:
+            break
+        try:
+            next_pages = _load_series_provider_pages(
+                mode,
+                letter,
+                [(provider, next_source_page) for provider in pending],
+                cold_wave_budget,
+            )
+        except SeriesCatalogColdLoadLimit:
+            if len(catalog_entries) < target_end:
+                raise
+            has_more_unverified = True
+            break
+        wave: Dict[str, List[FilmpalastSeriesResult]] = {}
+        for provider in pending:
+            results = next_pages.get((provider, next_source_page), [])
+            wave[provider] = unique_page(provider, results)
+            if not results:
+                exhausted.add(provider)
+            elif not wave[provider]:
+                duplicate_only_pages[provider] += 1
+                if duplicate_only_pages[provider] >= 2:
+                    exhausted.add(provider)
+            else:
+                duplicate_only_pages[provider] = 0
+        catalog_entries.extend(_mix_series_provider_results(
+            wave,
+            priority,
+            claimed_identities,
+        ))
+        next_source_page += 1
+
+    start = (page - 1) * SERIES_BROWSE_PAGE_SIZE
+    page_entries = catalog_entries[start:target_end]
+    return {
+        "entries": page_entries,
+        "page": page,
+        "has_more": page < SERIES_MAX_GLOBAL_PAGE and (
+            len(catalog_entries) > target_end or has_more_unverified
+        ),
+        "sources": _series_catalog_sources(page_entries, priority),
+    }
+
+
+def series_catalog_page(mode: str, page: int = 1, letter: str = "") -> dict:
+    """Single-Flight-Wrapper für Warmup und gleichzeitig öffnende Browser."""
+    with state.series_catalog_lock:
+        return _series_catalog_page_locked(mode, page, letter)
+
+
+def series_search_catalog(query: str) -> dict:
+    """Gruppiert die freie Suche nach Titel und zeigt alternative Quellen an."""
+    priority = provider_priority("series")
+    entries = _mix_series_provider_results(
+        _search_series_provider_results(query),
+        priority,
+    )
+    wanted = _norm_title(query)
+    entries.sort(key=lambda entry: (
+        _norm_title(entry.result.title) != wanted,
+        wanted not in _norm_title(entry.result.title),
+        abs(len(_norm_title(entry.result.title)) - len(wanted)),
+        strip_source_suffix(entry.result.title).casefold(),
+    ))
+    return {
+        "entries": entries,
+        "page": 1,
+        "has_more": False,
+        "sources": _series_catalog_sources(entries, priority),
+    }
+
+
+def warm_home_series_cache() -> None:
+    """Bereitet die gemischte Serien-Startansicht im Hintergrund vor."""
+    try:
+        catalog = series_catalog_page("discover", 1)
+        log(f"Serien-Startansicht vorbereitet: {len(catalog['entries'])} Serien.")
+    except Exception as exc:
+        log(f"Serien-Startansicht konnte nicht vorab geladen werden: {exc}", "warn")
 
 
 def _norm_title(title: str) -> str:
@@ -5935,62 +6427,64 @@ async def api_tmdb_movies(body: MovieMetadataBody):
 # ── Serien ───────────────────────────────────────────────────────────────────
 @app.get("/api/series")
 async def api_series(mode: str = "search", query: str = "", letter: str = "", page: int = 1):
+    if page < 1 or page > SERIES_MAX_GLOBAL_PAGE:
+        raise HTTPException(400, f"Seite muss zwischen 1 und {SERIES_MAX_GLOBAL_PAGE} liegen.")
+
     def _work():
         if mode == "search":
             q = query.strip()
             if not q:
-                return {"results": [], "direct_series": None, "mode": "search", "page": 1, "last_page_full": False}
+                return {
+                    "entries": [], "direct_series": None, "mode": "search",
+                    "page": 1, "has_more": False, "sources": [],
+                }
             if q.startswith("http"):
                 series = get_series_for_value(q)
                 if series is None:
-                    return {"results": [], "direct_series": None, "mode": "search", "page": 1, "last_page_full": False}
+                    return {
+                        "entries": [], "direct_series": None, "mode": "search",
+                        "page": 1, "has_more": False, "sources": [],
+                    }
                 stub = FilmpalastSeriesResult(
                     title=series.title, base_slug=series.base_slug,
                     sample_slug=series.all_episodes[0].slug if series.all_episodes else "",
                     sample_url=series.url,
                 )
                 state.series_cache[series.base_slug] = series
+                provider = provider_for_value(stub.sample_slug or stub.base_slug or stub.sample_url)
+                entry = _SeriesCatalogEntry(provider, stub, (provider,))
                 return {
-                    "results": [stub], "direct_series": series_to_dict(series),
-                    "mode": "search", "page": 1, "last_page_full": False,
+                    "entries": [entry], "direct_series": series_to_dict(series),
+                    "mode": "search", "page": 1, "has_more": False,
+                    "sources": _series_catalog_sources(
+                        [entry], provider_priority("series"),
+                    ),
                 }
             try:
-                results = search_series_candidates(q)
+                catalog = series_search_catalog(q)
             except Exception as exc:
                 log(f"Serien-Suche fehlgeschlagen: {exc}", "warn")
-                results = []
-            return {"results": results, "direct_series": None, "mode": "search", "page": 1, "last_page_full": False}
+                catalog = {
+                    "entries": [], "page": 1, "has_more": False, "sources": [],
+                }
+            return {**catalog, "direct_series": None, "mode": "search"}
 
-        # Browse-Rubriken sind Serienstream-spezifisch; die freie Suche und alle
-        # Download-Fallbacks folgen dagegen der konfigurierten Priorität.
-        results = []
+        browse_mode = mode if mode in {"discover", "new", "trending", "alpha"} else "discover"
         try:
-            with state.sto_lock:
-                sto = get_sto_scraper()
-                if mode == "trending":
-                    results = sto.list_trending(page)
-                elif mode == "alpha":
-                    results = sto.list_series_alpha(letter, page)
-                else:  # "new"
-                    results = sto.list_new(page)
-        except Exception as exc:
-            log(f"serienstream {mode} übersprungen: {exc}", "warn")
-            results = []
-        # new/trending sind einseitige Rubriken (keine Weiter-Seite); alpha
-        # paginiert in 32er-Blöcken.
-        last_full = mode == "alpha" and len(results) >= 32
-        return {
-            "results": results, "direct_series": None, "mode": mode, "page": page,
-            "last_page_full": last_full,
-        }
+            catalog = series_catalog_page(browse_mode, page, letter)
+        except SeriesCatalogColdLoadLimit as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {**catalog, "direct_series": None, "mode": browse_mode}
 
     data = await run_in_threadpool(_work)
     return {
-        "results": [asdict(r) for r in data["results"]],
+        "results": [_series_entry_to_dict(entry) for entry in data["entries"]],
         "direct_series": data["direct_series"],
         "mode": data["mode"],
         "page": data["page"],
-        "last_page_full": data["last_page_full"],
+        "has_more": data["has_more"],
+        "last_page_full": data["has_more"],
+        "sources": data["sources"],
     }
 
 
@@ -6768,6 +7262,8 @@ async def api_provider_priority_set(body: ProviderPriorityBody):
         state.provider_priorities = appconfig.load_provider_priorities()
     with state.movie_list_cache_lock:
         state.movie_list_cache.clear()
+    with state.series_list_cache_lock:
+        state.series_list_cache.clear()
     state.fallback_series_cache.clear()
     return _provider_priority_payload(saved=True)
 

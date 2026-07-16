@@ -147,8 +147,9 @@
 
     <section class="tab-content" id="tab-serien">
       <div class="bar">
-        <input id="series-search" type="text" placeholder="Serientitel oder serienstream.to-URL (z.B. https://serienstream.to/serie/the-last-of-us)">
+        <input id="series-search" type="text" placeholder="Serientitel oder URL eines Serienanbieters">
         <button id="series-search-btn" class="btn btn-accent">Suchen</button>
+        <button id="series-discover-btn" class="btn btn-ghost">Entdecken</button>
         <button id="series-new-btn" class="btn btn-ghost">Neu</button>
         <button id="series-trending-btn" class="btn btn-ghost">Angesagt</button>
         <button id="series-az-btn" class="btn btn-ghost">A-Z  ⌄</button>
@@ -170,12 +171,15 @@
         <div class="panel results-panel">
           <div class="panel-head">
             <span class="panel-title">Serien-Ergebnisse</span>
-            <span id="series-status" class="dim">Serientitel suchen oder Episode-URL einfügen …</span>
+            <span id="series-status" class="dim">Wird beim Öffnen automatisch geladen …</span>
           </div>
           <div id="series-results" class="list"></div>
           <div id="series-pager" class="pager hidden">
             <button id="series-pager-prev" class="btn btn-ghost" disabled>‹  Zurück</button>
-            <span id="series-pager-label" class="accent"></span>
+            <div class="fp-pager-copy" role="status" aria-live="polite" aria-atomic="true">
+              <span id="series-pager-label" class="accent"></span>
+              <span id="series-pager-sources" class="fp-pager-sources dim"></span>
+            </div>
             <button id="series-pager-next" class="btn btn-accent" disabled>Weiter  ›</button>
           </div>
         </div>

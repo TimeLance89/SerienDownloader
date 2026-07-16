@@ -7,6 +7,7 @@ const state = {
   },
   series: {
     results: [], browseMode: null, page: 1, lastPageFull: false,
+    sources: [], browseRequestSeq: 0, loadingBrowse: false,
     current: null, currentSampleSlug: "", epPicked: new Set(),
     cache: {}, pendingBaseSlug: "", requestSeq: 0, viewGeneration: 0,
     jellyfinRefreshSeq: 0, jellyfinRefreshByBase: new Map(),
@@ -34,7 +35,7 @@ function escapeHtml(s) {
 }
 
 // ── Tabs ─────────────────────────────────────────────────────────────────
-function switchTab(name) {
+function switchTab(name, { autoLoad = true } = {}) {
   document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab-content").forEach((s) => s.classList.toggle("active", s.id === `tab-${name}`));
   // Im Einstellungen-Bereich die Download-Sidebar ausblenden (eigener Vollbereich).
@@ -42,6 +43,7 @@ function switchTab(name) {
   closeMobileQueue();
   state.tab = name;
   if (name === "bibliothek" && !state.wl.loaded) refreshWatchlist();
+  if (name === "serien" && autoLoad) ensureSeriesResults();
 }
 
 // ── Log console ──────────────────────────────────────────────────────────
@@ -815,7 +817,17 @@ function updateSeriesPager() {
   const mode = state.series.browseMode;
   if (!mode || mode === "search") { pager.classList.add("hidden"); return; }
   pager.classList.remove("hidden");
-  document.getElementById("series-pager-label").textContent = `Seite ${state.series.page}`;
+  const sourceCount = state.series.sources.length;
+  const sourceWord = sourceCount === 1 ? "Quelle" : "Quellen";
+  document.getElementById("series-pager-label").textContent = sourceCount
+    ? `Seite ${state.series.page} · ${sourceCount} ${sourceWord}`
+    : `Seite ${state.series.page}`;
+  const sourceSummary = state.series.sources
+    .map((source) => `${source.label} ${source.count}`)
+    .join(" · ");
+  const sourceElement = document.getElementById("series-pager-sources");
+  sourceElement.textContent = sourceSummary;
+  sourceElement.title = sourceSummary;
   document.getElementById("series-pager-prev").disabled = state.series.page <= 1;
   document.getElementById("series-pager-next").disabled = !state.series.lastPageFull;
 }
@@ -838,7 +850,12 @@ function renderSeriesResults() {
     year.textContent = r.year || "";
     const info = document.createElement("span");
     info.className = "dim";
-    info.textContent = "—";
+    const resultSources = Array.isArray(r.sources) ? r.sources : [];
+    const sourceLabels = resultSources.map((source) => source.label).filter(Boolean);
+    info.textContent = sourceLabels.length > 1
+      ? `${sourceLabels.length} Quellen`
+      : (sourceLabels[0] || r.provider_label || "—");
+    info.title = sourceLabels.join(" · ");
     row.append(title, year, info);
     row.addEventListener("click", () => loadSeries(r));
     container.appendChild(row);
@@ -857,25 +874,46 @@ function updateSeriesResultSelection() {
 }
 
 function applySeriesResults(data) {
-  state.series.results = data.results;
-  state.series.page = data.page;
-  state.series.lastPageFull = data.last_page_full;
+  state.series.results = Array.isArray(data.results) ? data.results : [];
+  state.series.page = data.page || 1;
+  state.series.lastPageFull = Boolean(data.has_more ?? data.last_page_full);
+  state.series.sources = Array.isArray(data.sources)
+    ? data.sources.filter((source) => Number(source.count) > 0)
+    : [];
   renderSeriesResults();
   updateSeriesPager();
+  const sourceCount = state.series.sources.length;
   document.getElementById("series-status").textContent =
-    data.results.length ? `${data.results.length} Serie(n) gefunden` : "Keine Serie gefunden.";
+    state.series.results.length
+      ? (sourceCount
+        ? `${state.series.results.length} Serie(n) · ${sourceCount} ${sourceCount === 1 ? "Quelle" : "Quellen"}`
+        : `${state.series.results.length} Serie(n) gefunden`)
+      : "Keine Serie gefunden.";
 }
 
 async function seriesSearch() {
   const q = document.getElementById("series-search").value.trim();
   if (!q) return;
+  const requestId = ++state.series.browseRequestSeq;
+  const previousMode = state.series.browseMode;
   state.series.browseMode = "search";
+  state.series.loadingBrowse = true;
   updateSeriesPager();
   document.getElementById("series-status").textContent = `Suche nach «${q}» …`;
-  const data = await api.series({ mode: "search", query: q });
-  applySeriesResults(data);
-  if (data.direct_series) {
-    showSeriesDetail(data.direct_series, firstEpisodeSlug(data.direct_series));
+  try {
+    const data = await api.series({ mode: "search", query: q });
+    if (requestId !== state.series.browseRequestSeq) return;
+    applySeriesResults(data);
+    if (data.direct_series) {
+      showSeriesDetail(data.direct_series, firstEpisodeSlug(data.direct_series));
+    }
+  } catch (error) {
+    if (requestId !== state.series.browseRequestSeq) return;
+    state.series.browseMode = state.series.results.length ? previousMode : null;
+    updateSeriesPager();
+    document.getElementById("series-status").textContent = `Fehler: ${error.message}`;
+  } finally {
+    if (requestId === state.series.browseRequestSeq) state.series.loadingBrowse = false;
   }
 }
 
@@ -887,10 +925,32 @@ function seriesParams(mode, page) {
 }
 
 async function seriesBrowse(mode, page) {
-  document.getElementById("series-status").textContent = "Lade …";
-  const data = await api.series(seriesParams(mode, page));
+  const requestId = ++state.series.browseRequestSeq;
+  const previousMode = state.series.browseMode;
   state.series.browseMode = mode;
-  applySeriesResults(data);
+  state.series.loadingBrowse = true;
+  updateSeriesPager();
+  const modeLabels = { discover: "interessante Serien", new: "neue Serien", trending: "angesagte Serien" };
+  document.getElementById("series-status").textContent = `Lade ${modeLabels[mode] || "Serien"} …`;
+  try {
+    const data = await api.series(seriesParams(mode, page));
+    if (requestId !== state.series.browseRequestSeq) return false;
+    applySeriesResults(data);
+    return true;
+  } catch (error) {
+    if (requestId !== state.series.browseRequestSeq) return false;
+    document.getElementById("series-status").textContent = `Fehler: ${error.message}`;
+    state.series.browseMode = state.series.results.length ? previousMode : null;
+    updateSeriesPager();
+    return false;
+  } finally {
+    if (requestId === state.series.browseRequestSeq) state.series.loadingBrowse = false;
+  }
+}
+
+function ensureSeriesResults() {
+  if (state.series.results.length || state.series.loadingBrowse) return;
+  seriesBrowse("discover", 1);
 }
 
 async function seriesPagerChange(delta) {
@@ -898,8 +958,7 @@ async function seriesPagerChange(delta) {
   if (!mode || mode === "search") return;
   const newPage = state.series.page + delta;
   if (newPage < 1) return;
-  const data = await api.series(seriesParams(mode, newPage));
-  applySeriesResults(data);
+  await seriesBrowse(mode, newPage);
 }
 
 async function loadSeries(result) {
@@ -1424,7 +1483,9 @@ function toggleWlSelect(baseSlug) {
 }
 
 async function openWatchlistEntry(baseSlug) {
-  switchTab("serien");
+  switchTab("serien", { autoLoad: false });
+  state.series.browseRequestSeq += 1;
+  state.series.loadingBrowse = false;
   const openGeneration = ++state.series.viewGeneration;
   document.getElementById("series-status").textContent = "Lade abonnierte Serie …";
   try {
@@ -2127,6 +2188,7 @@ async function initApp() {
   // Serien
   document.getElementById("series-search-btn").addEventListener("click", seriesSearch);
   document.getElementById("series-search").addEventListener("keydown", (e) => { if (e.key === "Enter") seriesSearch(); });
+  document.getElementById("series-discover-btn").addEventListener("click", () => seriesBrowse("discover", 1));
   document.getElementById("series-new-btn").addEventListener("click", () => seriesBrowse("new", 1));
   document.getElementById("series-trending-btn").addEventListener("click", () => seriesBrowse("trending", 1));
   document.getElementById("series-az-btn").addEventListener("click", () => {
