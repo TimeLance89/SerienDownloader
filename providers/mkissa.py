@@ -166,6 +166,8 @@ class MkissaScraper:
         self._crypto_lock = threading.RLock()
         self._detail_cache: Dict[str, tuple[float, MkissaAnime]] = {}
         self._detail_lock = threading.RLock()
+        self._catalog_totals: Dict[tuple[str, str], int] = {}
+        self._browse_cache: Dict[tuple[str, str], dict] = {}
 
     @property
     def headers(self) -> dict:
@@ -214,24 +216,52 @@ class MkissaScraper:
             ]
             entries = self._parse_entries(shows)
             total = int(popular.get("total") or 0)
+            total_key = (mode, "")
+            if total:
+                self._catalog_totals[total_key] = total
+            else:
+                total = self._catalog_totals.get(total_key, 0)
             return {
                 "results": [entry.public_dict() for entry in entries],
                 "page": page,
-                "has_more": page * limit < total,
+                "has_more": (
+                    page * limit < total
+                    if total
+                    else len(entries) >= limit
+                ),
                 "total": total,
             }
 
         search = {"query": query.strip()} if mode == "search" else {
             "sortBy": "Popular" if mode == "popular" else "Recent",
         }
-        combined: Dict[str, MkissaAnime] = {}
-        totals: List[int] = []
-        upstream_pages = 2 if limit > 24 else 1
-        first_upstream_page = (page - 1) * upstream_pages + 1
-        for upstream_page in range(
-            first_upstream_page,
-            first_upstream_page + upstream_pages,
+        cache_key = (mode, query.strip().casefold())
+        cached = self._browse_cache.get(cache_key)
+        if (
+            cached is None
+            or (
+                page == 1
+                and time.time() - float(cached.get("created_at") or 0) > 300
+            )
         ):
+            cached = {
+                "created_at": time.time(),
+                "entries": [],
+                "by_id": {},
+                "next_page": 1,
+                "total": 0,
+                "exhausted": False,
+            }
+            self._browse_cache[cache_key] = cached
+
+        target_count = page * limit
+        while (
+            len(cached["entries"]) < target_count
+            and not cached["exhausted"]
+        ):
+            upstream_page = int(cached["next_page"])
+            received_counts: List[int] = []
+            new_entries = 0
             for translation in ("dub", "sub"):
                 variables = {
                     "search": search,
@@ -242,26 +272,45 @@ class MkissaScraper:
                 }
                 response = self._graphql(variables, SEARCH_HASH, SEARCH_QUERY)
                 shows = response.get("data", {}).get("shows", {})
-                totals.append(
-                    int((shows.get("pageInfo") or {}).get("total") or 0)
+                raw_entries = shows.get("edges") or []
+                received_counts.append(len(raw_entries))
+                reported_total = int(
+                    (shows.get("pageInfo") or {}).get("total") or 0
                 )
-                for entry in self._parse_entries(shows.get("edges") or []):
-                    existing = combined.get(entry.id)
+                if reported_total:
+                    cached["total"] = max(
+                        int(cached["total"]),
+                        reported_total,
+                    )
+                for entry in self._parse_entries(raw_entries):
+                    existing = cached["by_id"].get(entry.id)
                     if existing is None:
-                        combined[entry.id] = entry
+                        cached["by_id"][entry.id] = entry
+                        cached["entries"].append(entry)
+                        new_entries += 1
                         continue
                     for track, count in entry.translations.items():
                         existing.translations[track] = max(
                             existing.translations.get(track, 0),
                             count,
                         )
-        results = list(combined.values())[:limit]
-        total = max(totals, default=0)
+            cached["next_page"] = upstream_page + 1
+            if (
+                not received_counts
+                or max(received_counts, default=0) < 20
+                or new_entries == 0
+            ):
+                cached["exhausted"] = True
+
+        start = (page - 1) * limit
+        end = start + limit
+        results = cached["entries"][start:end]
+        has_more = len(cached["entries"]) > end or not cached["exhausted"]
         return {
             "results": [entry.public_dict() for entry in results],
             "page": page,
-            "has_more": page * limit < total,
-            "total": total,
+            "has_more": has_more,
+            "total": int(cached["total"]),
         }
 
     def get_anime(self, anime_id: str, force: bool = False) -> MkissaAnime:
@@ -362,6 +411,7 @@ class MkissaScraper:
         fallback_query: str,
         signed: bool = False,
         retry_crypto: bool = True,
+        retry_rate_limit: bool = True,
     ) -> dict:
         extensions = {
             "persistedQuery": {
@@ -383,6 +433,30 @@ class MkissaScraper:
         response.raise_for_status()
         payload = response.json()
         errors = payload.get("errors") or []
+        rate_limit_message = next((
+            str(error.get("message") or "")
+            for error in errors
+            if isinstance(error, dict)
+            and "too many requests" in str(error.get("message") or "").casefold()
+        ), "")
+        if retry_rate_limit and rate_limit_message:
+            seconds_match = re.search(r"(\d+)\s*seconds?", rate_limit_message)
+            cooldown = min(
+                12,
+                max(1, int(seconds_match.group(1)) if seconds_match else 3),
+            )
+            self._log(
+                f"MKissa-API-Limit erreicht – Wiederholung in {cooldown} Sekunden."
+            )
+            time.sleep(cooldown)
+            return self._graphql(
+                variables,
+                query_hash,
+                fallback_query,
+                signed=signed,
+                retry_crypto=retry_crypto,
+                retry_rate_limit=False,
+            )
         error_codes = {
             str((error.get("extensions") or {}).get("code") or error.get("message") or "")
             for error in errors
@@ -398,6 +472,7 @@ class MkissaScraper:
                 fallback_query,
                 signed=True,
                 retry_crypto=False,
+                retry_rate_limit=retry_rate_limit,
             )
         if any(
             "PersistedQueryNotFound" in str(error.get("message") or "")
