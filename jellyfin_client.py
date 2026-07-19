@@ -8,6 +8,7 @@ Implementierung (urllib), da Jellyfin im lokalen Netz läuft und keine
 Cloudflare-/TLS-Tricks nötig sind.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -18,6 +19,7 @@ from typing import List, Optional
 from urllib.parse import quote, urlencode
 
 logger = logging.getLogger(__name__)
+MAX_ITEM_PAGES = 10_000
 
 
 def _normalize(title: str) -> str:
@@ -81,9 +83,14 @@ class JellyfinClient:
         page_size = max(1, min(int(page_size or 1000), 5000))
         start = 0
         result: List[dict] = []
-        while True:
+        seen_pages: set[str] = set()
+        for _page_number in range(MAX_ITEM_PAGES):
             page_params = dict(params)
-            page_params.update({"StartIndex": str(start), "Limit": str(page_size)})
+            page_params.update({
+                "StartIndex": str(start),
+                "Limit": str(page_size),
+                "EnableTotalRecordCount": "true",
+            })
             req = urllib.request.Request(
                 f"{self.base_url}/Items?{urlencode(page_params)}",
                 headers={"X-Emby-Token": self.api_key},
@@ -94,10 +101,24 @@ class JellyfinClient:
             except Exception as exc:
                 logger.warning("%s fehlgeschlagen (%s): %s", label, self.base_url, exc)
                 return None
+            if not isinstance(data, dict):
+                logger.warning("%s lieferte ein ungültiges Antwortobjekt (%s)", label, self.base_url)
+                return None
             page = data.get("Items") or []
-            if not isinstance(page, list):
+            if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
                 logger.warning("%s lieferte ungültige Daten (%s)", label, self.base_url)
                 return None
+            if page:
+                fingerprint = hashlib.sha256(
+                    json.dumps(page, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                if fingerprint in seen_pages:
+                    logger.warning(
+                        "%s brach eine wiederholte Jellyfin-Seite bei StartIndex %d ab (%s)",
+                        label, start, self.base_url,
+                    )
+                    return None
+                seen_pages.add(fingerprint)
             result.extend(page)
             start += len(page)
             try:
@@ -110,6 +131,9 @@ class JellyfinClient:
                 or (total is None and len(page) < page_size)
             ):
                 break
+        else:
+            logger.warning("%s überschritt das Seitenlimit (%s)", label, self.base_url)
+            return None
         return result
 
     def list_movies(self, limit: int = 1000) -> Optional[List[dict]]:
@@ -121,6 +145,9 @@ class JellyfinClient:
             # Sonst blendet Jellyfin einzelne Filme aus Collections/Boxsets
             # aus. Diese Filme sind in der UI sichtbar, fehlen aber in /Items.
             "CollapseBoxSetItems": "false",
+            "ExcludeLocationTypes": "Virtual,Offline",
+            "IsMissing": "false",
+            "IsPlaceHolder": "false",
             "Fields": "ProductionYear,OriginalTitle,SortName,ProviderIds",
         }, limit, "Jellyfin-Bibliotheksabruf")
         if items is None:
@@ -197,6 +224,9 @@ class JellyfinClient:
         except Exception as exc:
             logger.warning("Jellyfin-Benutzerabruf fehlgeschlagen (%s): %s", self.base_url, exc)
             return None
+        if not isinstance(data, list) or any(not isinstance(user, dict) for user in data):
+            logger.warning("Jellyfin-Benutzerabruf lieferte ungültige Daten (%s)", self.base_url)
+            return None
         return [
             {"id": str(user.get("Id", "")), "name": str(user.get("Name", ""))}
             for user in data
@@ -213,6 +243,9 @@ class JellyfinClient:
         items = self._list_items({
             "IncludeItemTypes": "Episode",
             "Recursive": "true",
+            "ExcludeLocationTypes": "Virtual,Offline",
+            "IsMissing": "false",
+            "IsPlaceHolder": "false",
             "Fields": "ParentIndexNumber,IndexNumber,SeriesName,SeriesId",
         }, limit, "Jellyfin-Episodenabruf")
         if items is None:
@@ -223,6 +256,11 @@ class JellyfinClient:
             episode = it.get("IndexNumber")
             series = it.get("SeriesName")
             if season is None or episode is None or not series:
+                continue
+            try:
+                season = int(season)
+                episode = int(episode)
+            except (TypeError, ValueError):
                 continue
             result.append({
                 "id": str(it.get("Id") or ""),
@@ -238,6 +276,9 @@ class JellyfinClient:
         items = self._list_items({
             "IncludeItemTypes": "Series",
             "Recursive": "true",
+            "ExcludeLocationTypes": "Virtual,Offline",
+            "IsMissing": "false",
+            "IsPlaceHolder": "false",
             "Fields": "ProviderIds,OriginalTitle,SortName",
         }, limit, "Jellyfin-Serienabruf")
         if items is None:
@@ -271,6 +312,9 @@ class JellyfinClient:
             "IncludeItemTypes": "Episode",
             "Recursive": "true",
             "EnableUserData": "true",
+            "ExcludeLocationTypes": "Virtual,Offline",
+            "IsMissing": "false",
+            "IsPlaceHolder": "false",
             "Fields": "ParentIndexNumber,IndexNumber,SeriesName,SeriesId",
         }, limit, "Jellyfin-Gesehen-Status")
         if items is None:
@@ -282,12 +326,17 @@ class JellyfinClient:
             series = item.get("SeriesName")
             if season is None or episode is None or not series:
                 continue
+            try:
+                season = int(season)
+                episode = int(episode)
+            except (TypeError, ValueError):
+                continue
             result.append({
                 "id": str(item.get("Id") or ""),
                 "series": series,
                 "series_id": str(item.get("SeriesId") or ""),
-                "season": int(season),
-                "episode": int(episode),
+                "season": season,
+                "episode": episode,
                 "played": bool((item.get("UserData") or {}).get("Played", False)),
             })
         return result

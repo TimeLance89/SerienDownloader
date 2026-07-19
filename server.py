@@ -249,15 +249,19 @@ class AppState:
         self.jellyfin_library: Optional[List[dict]] = None
         self.jellyfin_library_time: float = 0.0
         self.jellyfin_library_available: bool = False
+        self.jellyfin_library_retry_after: float = 0.0
         self.jellyfin_episodes: Optional[List[dict]] = None
         self.jellyfin_episodes_time: float = 0.0
         self.jellyfin_episodes_available: bool = False
+        self.jellyfin_episodes_retry_after: float = 0.0
         self.jellyfin_series: Optional[List[dict]] = None
         self.jellyfin_series_time: float = 0.0
         self.jellyfin_series_available: bool = False
+        self.jellyfin_series_retry_after: float = 0.0
         self.jellyfin_user_episodes: Optional[List[dict]] = None
         self.jellyfin_user_episodes_time: float = 0.0
         self.jellyfin_user_episodes_available: bool = False
+        self.jellyfin_user_episodes_retry_after: float = 0.0
         self.jellyfin_config_generation: int = 0
         self.jellyfin_movie_data_generation: int = 0
         self.jellyfin_episode_data_generation: int = 0
@@ -777,15 +781,19 @@ def _set_runtime_jellyfin_config(cfg: dict) -> None:
         state.jellyfin_library = None
         state.jellyfin_library_time = 0.0
         state.jellyfin_library_available = False
+        state.jellyfin_library_retry_after = 0.0
         state.jellyfin_episodes = None
         state.jellyfin_episodes_time = 0.0
         state.jellyfin_episodes_available = False
+        state.jellyfin_episodes_retry_after = 0.0
         state.jellyfin_series = None
         state.jellyfin_series_time = 0.0
         state.jellyfin_series_available = False
+        state.jellyfin_series_retry_after = 0.0
         state.jellyfin_user_episodes = None
         state.jellyfin_user_episodes_time = 0.0
         state.jellyfin_user_episodes_available = False
+        state.jellyfin_user_episodes_retry_after = 0.0
         with state.watchlist_lock:
             for entry in state.watchlist:
                 entry["check_generation"] = int(entry.get("check_generation", 0)) + 1
@@ -805,6 +813,7 @@ def get_tmdb_series(title: str, tmdb_id="", force: bool = False) -> Optional[dic
 
 
 JELLYFIN_CACHE_TTL = 300  # Sekunden – wie lange die komplette Filmliste gecacht wird
+JELLYFIN_ERROR_RETRY_SECONDS = 30
 
 
 def get_jellyfin_library(force: bool = False) -> Optional[List[dict]]:
@@ -822,6 +831,9 @@ def get_jellyfin_library(force: bool = False) -> Optional[List[dict]]:
             )
             if not jf_client.configured:
                 return None
+            if not force and now < state.jellyfin_library_retry_after:
+                return state.jellyfin_library
+            needs_fetch = needs_fetch or not state.jellyfin_library_available
             if not needs_fetch:
                 return state.jellyfin_library
             state.jellyfin_movie_data_generation += 1
@@ -834,8 +846,10 @@ def get_jellyfin_library(force: bool = False) -> Optional[List[dict]]:
                 state.jellyfin_library = fresh
                 state.jellyfin_library_time = time.time()
                 state.jellyfin_library_available = True
+                state.jellyfin_library_retry_after = 0.0
             else:
                 state.jellyfin_library_available = False
+                state.jellyfin_library_retry_after = time.time() + JELLYFIN_ERROR_RETRY_SECONDS
             return state.jellyfin_library
 
 
@@ -855,6 +869,9 @@ def get_jellyfin_episodes(force: bool = False) -> Optional[List[dict]]:
             )
             if not jf_client.configured:
                 return None
+            if not force and now < state.jellyfin_episodes_retry_after:
+                return state.jellyfin_episodes
+            needs_fetch = needs_fetch or not state.jellyfin_episodes_available
             if not needs_fetch:
                 return state.jellyfin_episodes
             state.jellyfin_episode_data_generation += 1
@@ -867,8 +884,10 @@ def get_jellyfin_episodes(force: bool = False) -> Optional[List[dict]]:
                 state.jellyfin_episodes = fresh
                 state.jellyfin_episodes_time = time.time()
                 state.jellyfin_episodes_available = True
+                state.jellyfin_episodes_retry_after = 0.0
             else:
                 state.jellyfin_episodes_available = False
+                state.jellyfin_episodes_retry_after = time.time() + JELLYFIN_ERROR_RETRY_SECONDS
             return state.jellyfin_episodes
 
 
@@ -886,6 +905,9 @@ def get_jellyfin_series(force: bool = False) -> Optional[List[dict]]:
             )
             if not jf_client.configured:
                 return None
+            if not force and now < state.jellyfin_series_retry_after:
+                return state.jellyfin_series
+            needs_fetch = needs_fetch or not state.jellyfin_series_available
             if not needs_fetch:
                 return state.jellyfin_series
             state.jellyfin_episode_data_generation += 1
@@ -898,8 +920,10 @@ def get_jellyfin_series(force: bool = False) -> Optional[List[dict]]:
                 state.jellyfin_series = fresh
                 state.jellyfin_series_time = time.time()
                 state.jellyfin_series_available = True
+                state.jellyfin_series_retry_after = 0.0
             else:
                 state.jellyfin_series_available = False
+                state.jellyfin_series_retry_after = time.time() + JELLYFIN_ERROR_RETRY_SECONDS
             return state.jellyfin_series
 
 
@@ -918,6 +942,9 @@ def get_jellyfin_user_episodes(force: bool = False) -> Optional[List[dict]]:
             )
             if not jf_client.configured or not user_id:
                 return None
+            if not force and now < state.jellyfin_user_episodes_retry_after:
+                return state.jellyfin_user_episodes
+            needs_fetch = needs_fetch or not state.jellyfin_user_episodes_available
             if not needs_fetch:
                 return state.jellyfin_user_episodes
             state.jellyfin_episode_data_generation += 1
@@ -928,10 +955,14 @@ def get_jellyfin_user_episodes(force: bool = False) -> Optional[List[dict]]:
             state.jellyfin_episode_data_generation += 1
             if items is None:
                 state.jellyfin_user_episodes_available = False
-                return None
+                state.jellyfin_user_episodes_retry_after = (
+                    time.time() + JELLYFIN_ERROR_RETRY_SECONDS
+                )
+                return state.jellyfin_user_episodes
             state.jellyfin_user_episodes = items
             state.jellyfin_user_episodes_time = time.time()
             state.jellyfin_user_episodes_available = True
+            state.jellyfin_user_episodes_retry_after = 0.0
             return state.jellyfin_user_episodes
 
 
@@ -6935,7 +6966,9 @@ async def api_movies(mode: str = "search", query: str = "", genre: str = "", pag
     data = await run_in_threadpool(_work)
     result_dicts = [asdict(r) for r in data["results"]]
     jf_items = await run_in_threadpool(get_jellyfin_library)
-    if jf_items is not None:
+    with state.jellyfin_cache_lock:
+        jf_available = state.jellyfin_library_available
+    if jf_items is not None and jf_available:
         jf_client = get_jellyfin_client()
         for rd in result_dicts:
             rd["in_jellyfin"] = jf_client.match(strip_source_suffix(rd["title"]), rd.get("year", ""), items=jf_items)
@@ -7015,7 +7048,9 @@ async def api_jellyfin_matches(body: MovieMetadataBody):
     """Aktualisiert nur die JF-Badges, ohne Anbieter oder Streams neu zu laden."""
     def _work():
         items = get_jellyfin_library()
-        if items is None:
+        with state.jellyfin_cache_lock:
+            library_available = state.jellyfin_library_available
+        if items is None or not library_available:
             return {}
         client = get_jellyfin_client()
         return {
