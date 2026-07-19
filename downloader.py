@@ -21,6 +21,7 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Callable, Dict, Optional
+from urllib.parse import urlparse
 
 # Fallback, falls das bevorzugte Staging direkt neben dem Ziel nicht angelegt
 # werden kann. Normalerweise liegt jeder Job in
@@ -74,6 +75,18 @@ NO_OUTPUT_TIMEOUT_SECONDS = _env_number(
     "DOWNLOAD_NO_OUTPUT_TIMEOUT_SECONDS", 300, 15, 3600,
 )
 SLOW_FAILURE_PREFIX = "Stream dauerhaft zu langsam"
+
+# Kleine Hoster (z.B. filmfrei24.com inkl. tv.filmfrei24.com) drosseln pro IP,
+# sobald mehrere Downloads gleichzeitig laufen. Deshalb laeuft pro Host-Gruppe
+# nur ein Download; der zweite Queue-Slot nimmt derweil einen anderen Host.
+PER_HOST_MAX_PARALLEL = int(_env_number("DOWNLOAD_PER_HOST_PARALLEL", 1, 1, 16))
+
+
+def host_group_for_url(url: str) -> str:
+    """Gruppiert Stream-URLs nach registrierbarer Domain (tv.x.com == x.com)."""
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) > 2 else host
 
 
 class _LowSpeedWatchdog:
@@ -367,6 +380,7 @@ class DownloadJob:
         self.provider = str(provider or "").strip().casefold()
         self.content_language = str(content_language or "").strip().casefold()
         self.allow_slow = bool(allow_slow)
+        self.host_group = host_group_for_url(stream_url)
         self.failure_kind = ""
         self.average_speed_bps = 0.0
         self.job_id = uuid.uuid4().hex
@@ -872,15 +886,20 @@ class DownloadQueue:
     - 1 zu langsam (zwei 1GB-Filme hintereinander wären doppelt so lang)
     - 3+ problematisch (Browser-Pool serialisiert VOE-Extraktionen ohnehin)
 
+    `per_host_limit` = gleichzeitige Downloads je Host-Gruppe (default 1,
+    via DOWNLOAD_PER_HOST_PARALLEL konfigurierbar). Verhindert, dass beide
+    Slots denselben drosselnden Server treffen.
+
     `on_queue_done` wird NUR aufgerufen wenn ALLE Jobs durch sind (Erfolg oder Abbruch).
     """
 
-    def __init__(self, max_parallel: int = 2):
+    def __init__(self, max_parallel: int = 2, per_host_limit: int = PER_HOST_MAX_PARALLEL):
         self._jobs: list = []
         self._active: Dict[int, tuple] = {}  # job_id -> (job, thread, start_time)
         self._lock = threading.Lock()
         self._running = False
         self._max_parallel = max(1, max_parallel)
+        self._per_host_limit = max(1, per_host_limit)
         self._next_job_id = 0
         self._scheduler_generation = 0
         self.on_queue_done: Optional[Callable] = None
@@ -999,7 +1018,11 @@ class DownloadQueue:
                 with self._lock:
                     self._active.pop(jid, None)
 
-            # 2. Starte neue Jobs wenn Slot frei
+            # 2. Starte neue Jobs wenn Slot frei. Pro Host-Gruppe laeuft nur
+            #    eine begrenzte Anzahl gleichzeitig, damit sich zwei Slots am
+            #    selben (drosselnden) Server nicht gegenseitig ausbremsen.
+            #    Gesperrte Jobs bleiben in Reihenfolge liegen; der Slot nimmt
+            #    den naechsten Job eines anderen Hosts.
             with self._lock:
                 while (
                     self._running
@@ -1007,7 +1030,23 @@ class DownloadQueue:
                     and len(self._active) < self._max_parallel
                     and self._jobs
                 ):
-                    jid, job = self._jobs.pop(0)
+                    active_hosts: Dict[str, int] = {}
+                    for active_job, _thread, _started in self._active.values():
+                        group = getattr(active_job, "host_group", "")
+                        if group:
+                            active_hosts[group] = active_hosts.get(group, 0) + 1
+                    index = next(
+                        (
+                            i for i, (_jid, queued) in enumerate(self._jobs)
+                            if active_hosts.get(
+                                getattr(queued, "host_group", ""), 0
+                            ) < self._per_host_limit
+                        ),
+                        None,
+                    )
+                    if index is None:
+                        break
+                    jid, job = self._jobs.pop(index)
                     thread = job.start()
                     self._active[jid] = (job, thread, time.monotonic())
 

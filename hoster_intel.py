@@ -49,6 +49,14 @@ DOMAIN_SCORE = {
 CIRCUIT_COOLDOWN_SECONDS = 20 * 60
 CIRCUIT_FAILURE_WINDOW_SECONDS = 10 * 60
 CIRCUIT_FAILURE_THRESHOLD = 3
+
+# Drosselphasen kleiner Hoster sind oft nach Minuten vorbei. Die Slow-Strafe
+# klingt deshalb schneller ab, und ein erfolgreicher Download mit ordentlicher
+# Rate hebt sie sofort auf – sonst wird z.B. der schnelle Direct-Endpunkt
+# stundenlang gemieden, obwohl er sich laengst erholt hat.
+SLOW_PENALTY_HARD_SECONDS = 2 * 60 * 60
+SLOW_PENALTY_SOFT_SECONDS = 6 * 60 * 60
+SLOW_RECOVERY_MIN_BPS = 512 * 1024
 _HARD_CIRCUIT_MARKERS = (
     "unsupported url",
     "cloudflare anti-bot",
@@ -112,9 +120,9 @@ class HosterIntel:
             elif speed >= 2 * 1024 * 1024:
                 score += 6
         slow_age = time.time() - float(speed_data.get("last_slow", 0) or 0)
-        if 0 <= slow_age < 6 * 60 * 60:
+        if 0 <= slow_age < SLOW_PENALTY_HARD_SECONDS:
             score -= 35
-        elif 0 <= slow_age < 24 * 60 * 60:
+        elif 0 <= slow_age < SLOW_PENALTY_SOFT_SECONDS:
             score -= 15
         return score
 
@@ -209,6 +217,9 @@ class HosterIntel:
                 if failure_kind == "slow":
                     data["slow"] = int(data.get("slow", 0) or 0) + 1
                     data["last_slow"] = time.time()
+                elif ok and speed_bps and speed_bps >= SLOW_RECOVERY_MIN_BPS:
+                    # Erholung nachgewiesen: Slow-Strafe sofort aufheben.
+                    data.pop("last_slow", None)
             self._save()
 
     def best_label(self, hosters: Iterable) -> str:

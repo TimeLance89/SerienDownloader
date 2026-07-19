@@ -4011,7 +4011,10 @@ def _enqueue_hoster_attempt(
             if (cancelled and cancelled()) or movie_slug not in state.picked:
                 return False
             add_front = getattr(state.dl_queue, "add_front", None)
-            if add_front:
+            # Langsame Reserven ohne Speed-Limit koennen stundenlang kriechen.
+            # Sie kommen ans Queue-Ende, damit schnelle Downloads nicht hinter
+            # ihnen verhungern; normale Folgeversuche behalten ihren Slot vorn.
+            if add_front and not last_resort:
                 add_front(job)
             else:
                 state.dl_queue.add(job)
