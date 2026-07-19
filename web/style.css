@@ -5585,20 +5585,27 @@ body.setup-open #dir-modal { z-index: 120; }
 }
 .result-card-library-badge {
   position: absolute;
-  z-index: 4;
-  top: 11px;
-  left: 11px;
-  display: inline-flex;
+  z-index: 5;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  min-height: 34px;
   align-items: center;
-  gap: 5px;
-  padding: 6px 9px;
+  justify-content: center;
+  gap: 7px;
+  padding: 8px 10px 7px;
   color: #effff1;
-  background: rgba(23, 81, 45, 0.94);
-  border: 1px solid rgba(113, 225, 137, 0.82);
-  border-radius: 999px;
-  box-shadow: 0 8px 22px -9px rgba(0, 0, 0, 0.95), 0 0 18px rgba(93, 214, 123, 0.22);
+  background:
+    linear-gradient(90deg, rgba(12, 47, 28, 0.97), rgba(26, 91, 50, 0.98), rgba(12, 47, 28, 0.97));
+  border: 0;
+  border-top: 1px solid rgba(132, 231, 151, 0.72);
+  border-radius: 0 0 11px 11px;
+  box-shadow: 0 -10px 24px -14px rgba(64, 204, 99, 0.72);
+  backdrop-filter: blur(10px) saturate(1.2);
+  -webkit-backdrop-filter: blur(10px) saturate(1.2);
   font: 800 8.5px/1 "JetBrains Mono", Consolas, monospace;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.13em;
   text-transform: uppercase;
 }
 .result-card-library-badge[hidden] { display: none; }
@@ -5606,14 +5613,16 @@ body.setup-open #dir-modal { z-index: 120; }
   content: "✓";
   display: grid;
   place-items: center;
-  width: 14px;
-  height: 14px;
-  color: #15381e;
-  background: #8aeba0;
+  width: 16px;
+  height: 16px;
+  color: #b7f4c1;
+  background: rgba(183, 244, 193, 0.10);
+  border: 1px solid rgba(183, 244, 193, 0.54);
   border-radius: 50%;
   font-size: 9px;
   letter-spacing: 0;
 }
+#fp-results .result-card-open { bottom: 45px; }
 .result-card-meta .jellyfin-badge { display: none; }
 
 @media (min-width: 821px) {
@@ -5798,14 +5807,14 @@ body.setup-open #dir-modal { z-index: 120; }
     font-size: 13px;
   }
   .result-card-library-badge {
-    top: 8px;
-    left: 8px;
-    padding: 5px 7px;
+    min-height: 30px;
+    padding: 7px 8px 6px;
     font-size: 7.5px;
   }
+  #fp-results .result-card-open { bottom: 38px; }
   .result-card-library-badge::before {
-    width: 13px;
-    height: 13px;
+    width: 14px;
+    height: 14px;
     font-size: 8px;
   }
   .result-card-title { font-size: 12.5px; }

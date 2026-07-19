@@ -837,7 +837,7 @@ function setFpJellyfinBadge(badge, owned) {
 
 function setFpPosterJellyfinBadge(badge, owned) {
   badge.hidden = !owned;
-  badge.textContent = "JF · DA";
+  badge.textContent = "In Jellyfin";
   badge.title = "Bereits in der Jellyfin-Bibliothek gefunden";
   badge.setAttribute("aria-label", "In Jellyfin vorhanden");
 }
