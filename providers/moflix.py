@@ -277,6 +277,7 @@ class MoflixScraper:
             sample_slug=f"{SOURCE_PREFIX}{title_id}:{slug}",
             sample_url=f"{BASE_URL}/titles/{title_id}/{slug}",
             year=self._year(title.get("release_date") or title.get("year")),
+            cover_url=title.get("poster") or "",
         )
 
     def _watch_src(self, video_id: int) -> str:

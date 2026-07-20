@@ -139,8 +139,16 @@ class FilmpalastScraper:
                     year = ym.group(0)
                     break
 
+            cover_url = ""
+            for img in article.find_all("img"):
+                src = img.get("src") or img.get("data-src", "")
+                if src and "files/movies" in src:
+                    cover_url = self._abs_url(src)
+                    break
+
             results.append(FilmpalastSearchResult(
                 title=title, slug=slug, url=full_url, year=year,
+                cover_url=cover_url,
             ))
 
         return results
@@ -505,10 +513,13 @@ class FilmpalastScraper:
                 grouped[base_slug] = FilmpalastSeriesResult(
                     title=title or base_slug, base_slug=base_slug,
                     sample_slug=r.slug, sample_url=r.url, year=r.year,
+                    cover_url=r.cover_url,
                 )
             else:
                 # Niedrigste Staffel/Episode als Sample bevorzugen (stabiler für get_series)
                 existing = grouped[base_slug]
+                if not existing.cover_url and r.cover_url:
+                    existing.cover_url = r.cover_url
                 existing_parsed = parse_episode_slug(existing.sample_slug)
                 if existing_parsed and (season, episode) < (existing_parsed[1], existing_parsed[2]):
                     existing.sample_slug = r.slug

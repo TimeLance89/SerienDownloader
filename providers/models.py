@@ -40,6 +40,7 @@ class FilmpalastSearchResult:
     is_movie: bool = True
     provider: str = ""
     content_language: str = ""
+    cover_url: str = ""
 
 
 @dataclass

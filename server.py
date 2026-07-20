@@ -346,7 +346,10 @@ class AppState:
         self.gated_retry_worker_running = False
         self.ytdlp_update_active = False
 
-        self.cover_cache: "OrderedDict[str, Optional[tuple]]" = OrderedDict()
+        self.cover_cache: "OrderedDict[str, tuple]" = OrderedDict()
+        # Fehlschläge nur kurz merken (Timestamp), damit transiente Fehler
+        # nicht bis zum Neustart als 502 hängen bleiben.
+        self.cover_fail_cache: "OrderedDict[str, float]" = OrderedDict()
         self.cover_cache_lock = threading.Lock()
 
         # Telegram-Anfragen werden über den Film-Slug bis zum Download-Ende
@@ -8682,6 +8685,9 @@ def _safe_public_http_url(raw_url: str) -> bool:
         return False
 
 
+COVER_FAIL_RETRY_SECONDS = 180.0
+
+
 def _fetch_cover_data(url: str) -> Optional[tuple]:
     if not _safe_public_http_url(url):
         return None
@@ -8689,6 +8695,11 @@ def _fetch_cover_data(url: str) -> Optional[tuple]:
         if url in state.cover_cache:
             state.cover_cache.move_to_end(url)
             return state.cover_cache[url]
+        failed_at = state.cover_fail_cache.get(url)
+        if failed_at is not None:
+            if time.time() - failed_at < COVER_FAIL_RETRY_SECONDS:
+                return None
+            del state.cover_fail_cache[url]
     try:
         def _download(manager, referer: str) -> tuple:
             resp = manager._curl.get(
@@ -8725,12 +8736,18 @@ def _fetch_cover_data(url: str) -> Optional[tuple]:
             data = _download(get_fp_scraper().session, referer)
     except Exception as exc:
         log(f"Cover-Laden fehlgeschlagen ({url}): {exc}", "warn")
-        data = None
+        with state.cover_cache_lock:
+            state.cover_fail_cache[url] = time.time()
+            state.cover_fail_cache.move_to_end(url)
+            while len(state.cover_fail_cache) > 512:
+                state.cover_fail_cache.popitem(last=False)
+        return None
     with state.cover_cache_lock:
         state.cover_cache[url] = data
         state.cover_cache.move_to_end(url)
         while len(state.cover_cache) > 256:
             state.cover_cache.popitem(last=False)
+        state.cover_fail_cache.pop(url, None)
     return data
 
 
