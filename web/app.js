@@ -71,9 +71,15 @@ const WATCH_CLEANUP_LABELS = {
 };
 const FP_METADATA_BATCH_SIZE = 4;
 const FP_METADATA_BATCH_CONCURRENCY = 3;
-const catalogInfiniteObserverSupported = "IntersectionObserver" in window;
-let fpInfiniteObserver = null;
-let seriesInfiniteObserver = null;
+// Auto-Nachladen ist ueber einen simplen Scroll-Listener am tatsaechlichen
+// Scroll-Container geloest (siehe initCatalogInfiniteScroll). Das funktioniert
+// in allen Zielbrowsern; die Konstante bleibt fuer die Retry-Button-Logik als
+// "Auto-Nachladen verfuegbar" erhalten.
+const catalogInfiniteObserverSupported = true;
+// Erneuter Naehe-Check je Tab (nach jedem Laden aufgerufen, damit ein noch zu
+// kurzer Container automatisch bis zum Fuellstand nachlaedt).
+let recheckFpInfinite = () => {};
+let recheckSeriesInfinite = () => {};
 let watchModeContext = null;
 let watchModeReturnFocus = null;
 
@@ -1336,6 +1342,10 @@ async function loadNextFpPage() {
     if (requestId === state.fp.requestSeq) {
       state.fp.loadingMore = false;
       updateFpInfiniteState();
+      // Fuellt einen noch zu kurzen Container automatisch weiter, ohne dass der
+      // Nutzer scrollen muss. Bricht von selbst ab, sobald genug Inhalt da ist
+      // oder der Katalog endet (Guards in loadNextFpPage).
+      recheckFpInfinite();
     }
   }
 }
@@ -1903,6 +1913,9 @@ async function seriesSearch() {
     if (requestId === state.series.browseRequestSeq) {
       state.series.loadingBrowse = false;
       updateSeriesInfiniteState();
+      // Fuellt einen noch zu kurzen Container automatisch weiter (Guards in
+      // loadNextSeriesPage brechen ab, sobald genug da ist oder Ende erreicht).
+      recheckSeriesInfinite();
     }
   }
 }
@@ -4068,39 +4081,41 @@ function retrySeriesInfiniteLoad() {
   else seriesBrowse(mode, 1);
 }
 
+// Vorlauf in Pixeln: sobald weniger als so viel bis zum unteren Rand des
+// intern scrollenden Tabs fehlt, wird die naechste Seite geladen. Grosszuegig
+// genug gewaehlt, dass die Folge-Eintraege laengst da sind, bevor man das Ende
+// sieht – aber kleiner als eine typische Seite an Inhalt, damit nie mehrere
+// Seiten auf einmal in einem Schwall nachgeladen werden.
+const CATALOG_PRELOAD_PX = 1400;
+
 function initCatalogInfiniteScroll() {
   document.getElementById("fp-infinite-retry").addEventListener("click", retryFpInfiniteLoad);
   document.getElementById("series-infinite-retry").addEventListener("click", retrySeriesInfiniteLoad);
-  if (!catalogInfiniteObserverSupported) return;
 
-  // rootMargin greift nur relativ zum tatsächlichen Scroll-Container. Die
-  // Tabs scrollen intern (#tab-filme/#tab-serien haben overflow-y:auto),
-  // das Dokument selbst scrollt nicht – mit root:null (Viewport) würde der
-  // grosszügige Vorlauf deshalb wirkungslos verpuffen und das Nachladen
-  // liefe erst beim tatsächlichen Erreichen des unteren Rands los.
-  const options = {
-    // Grosszuegiger Vorlauf, damit das Nachladen weit ausserhalb des
-    // sichtbaren Bereichs passiert und beim Scrollen nie als Ladepause
-    // wahrnehmbar wird.
-    rootMargin: "1800px 0px",
-    threshold: 0.01,
+  // Ein Scroll-Listener direkt am echten Scroll-Container ist zuverlaessiger
+  // als ein IntersectionObserver: dessen rootMargin greift bei verschachtelten
+  // Scroll-Containern (Tab scrollt intern, Dokument nicht) je nach Browser
+  // nicht sauber, wodurch der Vorlauf verpuffte oder in Schueben nachlud.
+  const bind = (containerId, loadNext) => {
+    const container = document.getElementById(containerId);
+    if (!container) return () => {};
+    let scheduled = false;
+    const run = () => {
+      scheduled = false;
+      const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (remaining <= CATALOG_PRELOAD_PX) loadNext();
+    };
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(run);
+    };
+    container.addEventListener("scroll", schedule, { passive: true });
+    return schedule;
   };
 
-  const fpRoot = document.getElementById("tab-filme");
-  fpInfiniteObserver = new IntersectionObserver((entries) => {
-    for (const entry of entries) {
-      if (entry.isIntersecting) loadNextFpPage();
-    }
-  }, { root: fpRoot, ...options });
-  fpInfiniteObserver.observe(document.getElementById("fp-infinite"));
-
-  const seriesRoot = document.getElementById("tab-serien");
-  seriesInfiniteObserver = new IntersectionObserver((entries) => {
-    for (const entry of entries) {
-      if (entry.isIntersecting) loadNextSeriesPage();
-    }
-  }, { root: seriesRoot, ...options });
-  seriesInfiniteObserver.observe(document.getElementById("series-infinite"));
+  recheckFpInfinite = bind("tab-filme", loadNextFpPage);
+  recheckSeriesInfinite = bind("tab-serien", loadNextSeriesPage);
 }
 
 function startInitialData() {
